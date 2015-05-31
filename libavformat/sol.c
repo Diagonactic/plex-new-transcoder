@@ -23,8 +23,10 @@
  * Based on documents from Game Audio Player and own research
  */
 
-#include "libavutil/bswap.h"
+#include "libavutil/channel_layout.h"
+#include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "internal.h"
 #include "pcm.h"
 
 /* if we don't know the size in advance */
@@ -33,8 +35,7 @@
 static int sol_probe(AVProbeData *p)
 {
     /* check file header */
-    uint16_t magic;
-    magic=av_le2ne16(*((uint16_t*)p->buf));
+    uint16_t magic = AV_RL32(p->buf);
     if ((magic == 0x0B8D || magic == 0x0C0D || magic == 0x0C8D) &&
         p->buf[2] == 'S' && p->buf[3] == 'O' &&
         p->buf[4] == 'L' && p->buf[5] == 0)
@@ -47,21 +48,18 @@ static int sol_probe(AVProbeData *p)
 #define SOL_16BIT   4
 #define SOL_STEREO 16
 
-static enum CodecID sol_codec_id(int magic, int type)
+static enum AVCodecID sol_codec_id(int magic, int type)
 {
-    if (magic == 0x0B8D)
-    {
-        if (type & SOL_DPCM) return CODEC_ID_SOL_DPCM;
-        else return CODEC_ID_PCM_U8;
-    }
     if (type & SOL_DPCM)
-    {
-        if (type & SOL_16BIT) return CODEC_ID_SOL_DPCM;
-        else if (magic == 0x0C8D) return CODEC_ID_SOL_DPCM;
-        else return CODEC_ID_SOL_DPCM;
-    }
-    if (type & SOL_16BIT) return CODEC_ID_PCM_S16LE;
-    return CODEC_ID_PCM_U8;
+        return AV_CODEC_ID_SOL_DPCM;
+
+    if (magic == 0x0B8D)
+        return AV_CODEC_ID_PCM_U8;
+
+    if (type & SOL_16BIT)
+        return AV_CODEC_ID_PCM_S16LE;
+
+    return AV_CODEC_ID_PCM_U8;
 }
 
 static int sol_codec_type(int magic, int type)
@@ -82,13 +80,12 @@ static int sol_channels(int magic, int type)
     return 2;
 }
 
-static int sol_read_header(AVFormatContext *s,
-                          AVFormatParameters *ap)
+static int sol_read_header(AVFormatContext *s)
 {
     unsigned int magic,tag;
     AVIOContext *pb = s->pb;
     unsigned int id, channels, rate, type;
-    enum CodecID codec;
+    enum AVCodecID codec;
     AVStream *st;
 
     /* check ".snd" header */
@@ -105,20 +102,22 @@ static int sol_read_header(AVFormatContext *s,
     codec = sol_codec_id(magic, type);
     channels = sol_channels(magic, type);
 
-    if (codec == CODEC_ID_SOL_DPCM)
+    if (codec == AV_CODEC_ID_SOL_DPCM)
         id = sol_codec_type(magic, type);
     else id = 0;
 
     /* now we are ready: build format streams */
-    st = av_new_stream(s, 0);
+    st = avformat_new_stream(s, NULL);
     if (!st)
         return -1;
     st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
     st->codec->codec_tag = id;
     st->codec->codec_id = codec;
     st->codec->channels = channels;
+    st->codec->channel_layout = channels == 1 ? AV_CH_LAYOUT_MONO :
+                                                AV_CH_LAYOUT_STEREO;
     st->codec->sample_rate = rate;
-    av_set_pts_info(st, 64, 1, rate);
+    avpriv_set_pts_info(st, 64, 1, rate);
     return 0;
 }
 
@@ -129,22 +128,21 @@ static int sol_read_packet(AVFormatContext *s,
 {
     int ret;
 
-    if (url_feof(s->pb))
+    if (avio_feof(s->pb))
         return AVERROR(EIO);
     ret= av_get_packet(s->pb, pkt, MAX_SIZE);
+    if (ret < 0)
+        return ret;
+    pkt->flags &= ~AV_PKT_FLAG_CORRUPT;
     pkt->stream_index = 0;
-
-    /* note: we need to modify the packet size here to handle the last
-       packet */
-    pkt->size = ret;
     return 0;
 }
 
 AVInputFormat ff_sol_demuxer = {
     .name           = "sol",
-    .long_name      = NULL_IF_CONFIG_SMALL("Sierra SOL format"),
+    .long_name      = NULL_IF_CONFIG_SMALL("Sierra SOL"),
     .read_probe     = sol_probe,
     .read_header    = sol_read_header,
     .read_packet    = sol_read_packet,
-    .read_seek      = pcm_read_seek,
+    .read_seek      = ff_pcm_read_seek,
 };

@@ -22,1045 +22,727 @@
  * MA 02110-1301, USA.
  */
 
-/*
- * Usage: '-vfilters ass=filename:somefile.ass|margin:50|encoding:utf-8'
- * Only 'filename' param is mandatory.
- */
-#ifdef __linux__
-#define _GNU_SOURCE
-#else
-#define _DARWIN_C_SOURCE // required for asprintf
-#endif
-
-#if defined(__APPLE__) || defined(__FreeBSD__)
-#include <sys/stat.h>
-#endif
-
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
-#include <libass/ass.h>
+#include <ass/ass.h>
 #include <fribidi/fribidi.h>
 #include "libavcodec/avcodec.h"
 #include "libavfilter/avfilter.h"
 #include "libavutil/avstring.h"
+#include "libavutil/opt.h"
+#include "libavformat/avformat.h"
 #include "vf_inlineass.h"
-//#include "defaults.h"
+#include "drawutils.h"
+#include "formats.h"
+#include "internal.h"
+#include "video.h"
+#include "libavutil/frame.h"
 
-#include "iconv.h"
+typedef struct {
+    const AVClass *class;
+    ASS_Library *library;
+    ASS_Renderer *renderer;
+    ASS_Track *track;
 
-#ifdef WINDOWS
-#include <shlobj.h>
-#include <asprintf.h>
-#endif
+    char *font_path;
+    char *fonts_dir;
+    char *fc_file;
+    double font_scale;
+    double font_size;
+    int margin;
 
-typedef struct
-{
-  ASS_Library *ass_library;
-  ASS_Renderer *ass_renderer;
-  ASS_Track *ass_track;
+    FFDrawContext draw;
 
-  int margin;
-  char *filename;
-  char *encoding;
-  double font_scale;
+    AVCodec *dec;
 
-  int64_t pts_offset;
-  int64_t event_number;
-  int frame_width, frame_height;
-  int vsub,hsub;   //< chroma subsampling
-  int flip_srt;
-  char *srt_encoding;
-
+    int mangle_state;
+    float vs_rgb2yuv[3][4];
+    float vs2rgb[3][4];
 } AssContext;
 
-extern char *executable_path;
-extern char *subtitle_path;
+#define OFFSET(x) offsetof(AssContext, x)
+#define FLAGS AV_OPT_FLAG_FILTERING_PARAM|AV_OPT_FLAG_VIDEO_PARAM
 
-static int parse_args(AVFilterContext *ctx, AssContext *context, const char* args);
-static av_cold int init(AVFilterContext *ctx, const char *args, void *opaque)
+#define ASS_TIME_BASE av_make_q(1, 1000)
+
+/* libass supports a log level ranging from 0 to 7 */
+static const int ass_libavfilter_log_level_map[] = {
+    AV_LOG_QUIET,               /* 0 */
+    AV_LOG_PANIC,               /* 1 */
+    AV_LOG_FATAL,               /* 2 */
+    AV_LOG_ERROR,               /* 3 */
+    AV_LOG_WARNING,             /* 4 */
+    AV_LOG_INFO,                /* 5 */
+    AV_LOG_VERBOSE,             /* 6 */
+    AV_LOG_DEBUG,               /* 7 */
+};
+
+static void ass_log(int ass_level, const char *fmt, va_list args, void *ctx)
 {
-  //fprintf(stderr, "----> init\n");
-  AssContext *context= ctx->priv;
+    int level = ass_libavfilter_log_level_map[ass_level];
 
-  /* defaults */
-  context->margin = 10;
-  context->encoding = "utf-8";
-  context->font_scale = 1.0;
-  context->filename = subtitle_path;
-  
-  if ( parse_args(ctx, context, args) )
-    return 1;
-
-  return 0;
+    av_vlog(ctx, level, fmt, args);
+    av_log(ctx, level, "\n");
 }
 
-void set_common_formats(AVFilterContext *ctx, AVFilterFormats *fmts,
-	enum AVMediaType type, int offin, int offout);
+static av_cold int init(AVFilterContext *ctx)
+{
+    AssContext *ass = ctx->priv;
+
+    ass->library = ass_library_init();
+
+    if (!ass->library) {
+        av_log(ctx, AV_LOG_ERROR, "ass_library_init() failed!\n");
+        return AVERROR(EINVAL);
+    }
+
+    ass_set_message_cb(ass->library, ass_log, ctx);
+    ass_set_extract_fonts(ass->library, 1);
+
+    if (ass->fonts_dir)
+        ass_set_fonts_dir(ass->library, ass->fonts_dir);
+
+    ass->renderer = ass_renderer_init(ass->library);
+    if (!ass->renderer) {
+        av_log(ctx, AV_LOG_ERROR, "ass_renderer_init() failed!\n");
+        return AVERROR(EINVAL);
+    }
+
+    ass_set_font_scale(ass->renderer, ass->font_scale);
+
+    ass->track = ass_new_track(ass->library);
+    if (!ass->track) {
+        av_log(ctx, AV_LOG_ERROR, "ass_new_track() failed!\n");
+        return AVERROR(EINVAL);
+    }
+
+    ass->mangle_state = 0;
+
+    return 0;
+}
+
+static av_cold void uninit(AVFilterContext *ctx)
+{
+    AssContext *ass = ctx->priv;
+
+    if (ass->track)
+        ass_free_track(ass->track);
+    if (ass->renderer)
+        ass_renderer_done(ass->renderer);
+    if (ass->library)
+        ass_library_done(ass->library);
+}
+
 static int query_formats(AVFilterContext *ctx)
 {
-	enum PixelFormat list[11] = {PIX_FMT_YUV444P,  PIX_FMT_YUV422P,  PIX_FMT_YUV420P,
-			       PIX_FMT_YUV411P,  PIX_FMT_YUV410P,
-			       PIX_FMT_YUVJ444P, PIX_FMT_YUVJ422P, PIX_FMT_YUVJ420P,
-			       PIX_FMT_YUV440P,  PIX_FMT_YUVJ440P,
-				   PIX_FMT_NONE};
-  set_common_formats(ctx, avfilter_make_format_list(list), AVMEDIA_TYPE_VIDEO, offsetof(AVFilterLink, in_formats), offsetof(AVFilterLink, out_formats));
-  return 0;
-}
-
-void vf_inlineass_set_aspect_ratio(AVFilterContext *context, double dar)
-{
-    //fprintf(stderr, "----> vf_inlineass_set_aspect_ratio %f\n", dar);
-	AssContext *assContext = (AssContext *)context->priv;
-	ASS_Renderer *assRenderer = assContext->ass_renderer;
-	
-	ass_set_aspect_ratio(assRenderer, 1.0 / dar, 1.0);
-}
-
-char *parse_srt_tags(char *input, size_t *length);
-char *parse_srt_tags(char *input, size_t *length)
-{
-    //fprintf(stderr, "---> reading %c, %d\n", input[0], *length);
-	size_t input_length = *length;
-	size_t output_length = input_length + 1;
-	char *output = NULL;
-	size_t j = 0;
-	int bState = 0;
-	int iState = 0;
-
-	for (size_t i = 0; i < input_length; i++)
-	{
-		if (input[i] == '<')
-		{
-			if (i < input_length - 1 && (input[i+1] == 'b' || input[i+1] == 'i'))
-			{
-				if (i < input_length - 2 && input[i+2] == '>')
-				{
-					output_length += 2;
-					if (!output)
-					{
-						output = av_malloc(output_length);
-						memcpy(output, input, i);
-						j = i;
-					}
-					else
-					{
-						output = av_realloc(output, output_length);
-					}
-					output[j++] = '{';
-					output[j++] = '\\';
-					output[j++] = input[i+1];
-					output[j++] = (input[i+1] == 'b' ? bState : iState) ? '0' : '1';
-					output[j++] = '}';
-
-					if (input[i+1] == 'b')
-					{
-						bState = !bState;
-					}
-					else
-					{
-						iState = !iState;
-					}
-					
-					i+=2;
-					
-					continue;
-				}
-				else if (i < input_length - 3 && input[i+2] == '/' && input[i+3] == '>')
-				{
-					output_length += 1;
-					if (!output)
-					{
-						output = av_malloc(output_length);
-						memcpy(output, input, i);
-						j = i;
-					}
-					else
-					{
-						output = av_realloc(output, output_length);
-					}
-					output[j++] = '{';
-					output[j++] = '\\';
-					output[j++] = input[i+1];
-					output[j++] = (input[i+1] == 'b' ? bState : iState) ? '0' : '1';
-					output[j++] = '}';
-
-					if (input[i+1] == 'b')
-					{
-						bState = !bState;
-					}
-					else
-					{
-						iState = !iState;
-					}
-
-					i+=3;
-					continue;
-				}
-			}
-			else if (i < input_length - 3 && input[i+1] == '/' && (input[i+2] == 'b' || input[i+2] == 'i') && input[i+3] == '>')
-			{
-				output_length += 1;
-				if (!output)
-				{
-					output = av_malloc(output_length);
-					memcpy(output, input, i);
-					j = i;
-				}
-				else
-				{
-					output = av_realloc(output, output_length);
-				}
-				output[j++] = '{';
-				output[j++] = '\\';
-				output[j++] = input[i+2];
-				output[j++] = (input[i+1] == 'b' ? bState : iState) ? '0' : '1';
-				output[j++] = '}';
-
-				if (input[i+1] == 'b')
-				{
-					bState = !bState;
-				}
-				else
-				{
-					iState = !iState;
-				}
-
-				i+=3;
-
-				continue;
-			}
-		}
-
-		if (output)
-		{
-			output[j++] = input[i];
-		}
-	}
-	
-	*length = output_length - 1;
-	
-	if (output)
-	{
-		av_free(input);
-		output[output_length - 1] = '\0';
-		return output;
-	}
-	
-	return input;
-}
-
-void vf_inlineass_append_data(AVFilterContext *context, enum CodecID codecID,
-	char *data, int dataSize, int64_t pts, int64_t duration, AVRational time_base)
-{
-    //fprintf(stderr, "----> appending %i bytes at %lld for %lld", dataSize, pts, duration);
-	AssContext *assContext = (AssContext *)context->priv;
-	ASS_Track *track = assContext->ass_track;
-	double current_time = pts * time_base.num / (double)time_base.den;
-	double packetDuration = duration * time_base.num / (double)time_base.den;
-
-	if (codecID == CODEC_ID_SSA)
-	{
-		if (!track->event_format)
-		{
-//			if (pts == -1)
-//			{
-//				data += 3;
-//			}
-
-			av_log(0, AV_LOG_ERROR, "Subtitle text at t=%f:\n%s", current_time, data);
-			/*int reprocess = */ass_process_codec_private(track, data, dataSize);
-			#if 0
-			if (reprocess)
-			{
-				ass_process_data(track, data, dataSize);
-			}
-			#endif
-		}
-		else
-		{
-			av_log(0, AV_LOG_ERROR, "Subtitle text at t=%f:\n%s", current_time, data);
-			ass_process_data(track, data, dataSize);
-		}
-	}
-	else if (codecID == 0)
-	{
-		//
-		// Audio track information display
-		//
-		if (!track->event_format)
-		{
-			char *eventLine =
-			    "[Events]\n"
-				"Format: EventIndex, Layer, Ignored, Start, Duration, Style, "
-				"Name, MarginL, MarginR, MarginV, Effect, Text\n";
-			ass_process_data(track, eventLine, strlen(eventLine));
-		}
-		
-		//
-		// Show for the first and last 15 seconds of the track
-		//
-		const int duration = 15;
-
-		char *terminatedData = av_malloc(dataSize + 1);
-		av_strlcpy(terminatedData, data, dataSize);
-		terminatedData[dataSize] = '\0';
-		
-		char *ssa;
-		int wrote = asprintf(&ssa, "%lld,0,0:00:00.00,0:00:%02d.00f,TrackDisplay,NoName,0000,0000,0000,,{\\fad(1000,1000)}%s",
-			assContext->event_number, duration, terminatedData);
-		av_log(0, AV_LOG_ERROR, "Subtitle text at t=0:\n%s", ssa);
-		ass_process_chunk(track, ssa, wrote, 0, duration * 1000.0);
-		
-		av_free(ssa);
-		
-		assContext->event_number++;
-		
-		const float endTime = pts / (double)AV_TIME_BASE - duration;
-		
-		if (endTime > duration * 3)
-		{
-			int hours = endTime / 3600.0;
-			int minutes = (endTime - (hours * 3600.0)) / 60.0;
-			float seconds = endTime - (hours * 3600.0) - (minutes * 60.0);
-
-			// The "Ignored" parameter should not actually be present.
-			wrote = asprintf(&ssa, "%lld,0,%d:%02d:%05.02f,0:00:%02d.00,TrackDisplay,NoName,0000,0000,0000,,{\\fad(1000,1000)}%s",
-				assContext->event_number, hours, minutes, seconds, duration, terminatedData);
-			av_log(0, AV_LOG_ERROR, "Subtitle text at t=%f:\n%s", endTime, ssa);
-			ass_process_chunk(track, ssa, wrote, endTime * 1000.0, duration * 1000.0);
-			
-			av_free(ssa);
-			av_free(terminatedData);
-
-			assContext->event_number++;
-		}
-	}
-	else
-	{
-		// Ignore headers
-		if (pts == -1)
-		{
-			return;
-		}
-		
-		if (!track->event_format)
-		{
-			char *eventLine =
-			    "[Events]\n"
-				"Format: EventIndex, Layer, Ignored, Start, Duration, Style, "
-				"Name, MarginL, MarginR, MarginV, Effect, Text\n";
-			ass_process_data(track, eventLine, strlen(eventLine));
-		}
-
-#define MIN(a, b) ((a) > (b) ? (b) : (a))
-#define MAX(a, b) ((a) < (b) ? (b) : (a))
-
-		const float charactersPerSecond = 25.0;
-		float displayDuration;
-		
-		if (packetDuration)
-		{
-			displayDuration = packetDuration;
-		}
-		else
-		{
-			displayDuration = MAX(1.75, MIN(3.5, dataSize / charactersPerSecond));
-		}
-		int hours = current_time / 3600.0;
-		int minutes = (current_time - (hours * 3600.0)) / 60.0;
-		float seconds = current_time - (hours * 3600.0) - (minutes * 60.0);
-		
-		int offset = 0;
-		if (codecID == CODEC_ID_MOV_TEXT)
-		{
-			dataSize = (data[offset++] << 8);
-			dataSize += data[offset++];
-		}
-		if (dataSize == 0)
-		{
-			return;
-		}
-		
-		char subtitleBuffer[512];
-		
-		// The "Ignored" parameter should not actually be present.
-		int wrote = snprintf(subtitleBuffer, 512, "%lld,0,%d:%d:%05.02f,0:00:%05.02f,Default,NoName,0000,0000,0000,,",
-			assContext->event_number, hours, minutes, seconds, displayDuration);
-		
-		char *subtitle = av_malloc(dataSize);
-		memcpy(subtitle, &data[offset], dataSize);
-		size_t subtitle_size = dataSize;
-		subtitle = parse_srt_tags(subtitle, &subtitle_size);
-
-		if (subtitle_size > 512 - wrote)
-		{
-			subtitle_size = 512 - wrote;
-		}
-		
-		av_strlcpy(&subtitleBuffer[wrote], subtitle, subtitle_size);
-		if (subtitle_size + wrote < 512)
-		{
-			subtitleBuffer[subtitle_size + wrote] = '\0';
-		}
-		av_log(0, AV_LOG_ERROR, "Subtitle text at t=%f:\n%s", current_time, subtitleBuffer);
-		ass_process_chunk(track, subtitleBuffer, wrote + subtitle_size, current_time * 1000.0, displayDuration * 1000);
-		
-		assContext->event_number++;
-	}
-}
-
-ASS_Track* ass_default_track(ASS_Library* library, int width, int height);
-ASS_Track* ass_default_track(ASS_Library* library, int width, int height) {
-    
-    //fprintf(stderr, "----> ass_default_track %ix%i\n", width, height);
-	ASS_Track* track = ass_new_track(library);
-
-	track->track_type = TRACK_TYPE_ASS;
-	track->Timer = 100.;
-	track->PlayResX = 640;
-	track->PlayResY = 480;
-	track->WrapStyle = 0;
-
-	ASS_Style *style;
-	int sid;
-//	double fs;
-	uint32_t c1, c2;
-
-	//
-	// Default style
-	//
-	sid = ass_alloc_style(track);
-	style = track->styles + sid;
-	style->Name = av_strdup("Default");
-	style->FontName = "Arial";
-	style->treat_fontname_as_pattern = 1;
-
-//	float text_font_scale_factor = 3.5;
-//	int subtitle_autoscale = 3;
-//	fs = track->PlayResY * text_font_scale_factor / 100.;
-//	// approximate autoscale coefficients
-//	if (subtitle_autoscale == 2)
-//		fs *= 1.3;
-//	else if (subtitle_autoscale == 3)
-//		fs *= 1.4;
-	style->FontSize = 26;
-
-	char *ass_color = NULL;
-	char *ass_border_color = NULL;
-	if (ass_color) c1 = strtoll(ass_color, NULL, 16);
-	else c1 = 0xFFFFFF00;
-	if (ass_border_color) c2 = strtoll(ass_border_color, NULL, 16);
-	else c2 = 0x00000000;
-
-	style->PrimaryColour = c1;
-	style->SecondaryColour = c1;
-	style->OutlineColour = c2;
-	style->BackColour = 0x00000000;
-	style->BorderStyle = 1;
-	style->Alignment = 2;
-	style->Outline = 2;
-	style->MarginL = 5;
-	style->MarginR = 5;
-	style->MarginV = 20;
-	style->ScaleX = 1.;
-	style->ScaleY = 1.;
-
-	//
-	// TrackDisplay style
-	//
-	sid = ass_alloc_style(track);
-	style = track->styles + sid;
-	style->Name = av_strdup("TrackDisplay");
-	style->FontName = "Arial";
-	style->treat_fontname_as_pattern = 1;
-
-//	text_font_scale_factor = 3.0;
-//	subtitle_autoscale = 3;
-//	fs = track->PlayResY * text_font_scale_factor / 100.;
-//	// approximate autoscale coefficients
-//	if (subtitle_autoscale == 2)
-//		fs *= 1.3;
-//	else if (subtitle_autoscale == 3)
-//		fs *= 1.4;
-	style->FontSize = 22;
-
-	ass_color = NULL;
-	ass_border_color = NULL;
-	if (ass_color) c1 = strtoll(ass_color, NULL, 16);
-	else c1 = 0xFFFFFF00;
-	if (ass_border_color) c2 = strtoll(ass_border_color, NULL, 16);
-	else c2 = 0x00000000;
-
-	style->PrimaryColour = c1;
-	style->SecondaryColour = c1;
-	style->OutlineColour = c2;
-	style->BackColour = 0x00000000;
-	style->BorderStyle = 1;
-	style->Alignment = 1;
-	style->Outline = 2;
-	style->MarginL = 10;
-	style->MarginR = 10;
-	style->MarginV = 20;
-	style->ScaleX = 1.;
-	style->ScaleY = 1.;
-
-	ass_process_force_style(track);
-	return track;
-}
-
-char * my_getline(FILE *fp);
-char * my_getline(FILE *fp) {
-    char * line = av_malloc(100), * linep = line;
-    size_t lenmax = 100, len = lenmax;
-    int c;
-
-    if(line == NULL)
-        return NULL;
-
-    for(int index=0;;index++) {
-        c = fgetc(fp);
-        if(c == EOF)
-            break;
-
-		if (c == '\r')
-		{
-			continue;
-		}
-		
-		if (c == '\n')
-		{
-			break;
-		}
-
-    // Does it look like BOM? Skip.
-    if (index == 0 && c == 0xEF)
-      continue;
-    if (index == 1 && c == 0xBB)
-      continue;
-    if (index == 2 && c == 0xBF)
-      continue;
-
-        if(--len == 0) {
-            char * linen = av_realloc(linep, lenmax *= 2);
-            len = lenmax;
-
-            if(linen == NULL) {
-                av_free(linep);
-                return NULL;
-            }
-            line = linen + (line - linep);
-            linep = linen;
-        }
-
-        *line++ = c;
-    }
-    *line = '\0';
-    return linep;
-}
-
-char *getlinewithopts(FILE *fp, iconv_t conv, int flip);
-char *getlinewithopts(FILE *fp, iconv_t conv, int flip)
-{
-	char *line_in = my_getline(fp);
-	size_t dst_length;
-	if (conv)
-	{
-		size_t src_length = strlen(line_in);
-		size_t in_length = strlen(line_in);
-		size_t orig_length = src_length;
-		dst_length = src_length;
-		char *result = av_malloc(dst_length + 1);
-		const char *in_tracking = line_in;
-		char *out_tracking = result;
-
-		long conv_length = -1;
-		int attempts = 0;
-		while (conv_length < 0 && attempts < 4)
-		{
-			conv_length = iconv(conv, &in_tracking, &in_length, &out_tracking, &dst_length);
-			
-			if (conv_length < 0 && errno == E2BIG)
-			{
-				orig_length <<= 1;
-				dst_length = orig_length;
-				in_length = src_length;
-
-				result = av_realloc(result, dst_length + 1);
-				in_tracking = line_in;
-				out_tracking = result;
-				attempts++;
-			}
-			else if (conv_length < 0)
-			{
-				av_free(result);
-
-				return line_in;
-			}
-		}
-		
-		av_free(line_in);
-		dst_length = orig_length - dst_length;
-		result[dst_length] = '\0';
-		
-		line_in = result;
-	}
-	else
-	{
-		dst_length = strlen(line_in);
-	}
-	
-	if (flip)
-	{
-#define LINE_LEN 512
-		FriBidiChar logical[LINE_LEN+1], visual[LINE_LEN+1]; // Hopefully these two won't smash the stack
-		char *op;
-		FriBidiParType type = FRIBIDI_PAR_RTL;
-		int char_set_num = fribidi_parse_charset ("UTF-8");
-		size_t len = fribidi_charset_to_unicode (char_set_num, line_in, dst_length, logical);
-		fribidi_boolean log2vis = fribidi_log2vis(logical, len, &type, visual, NULL, NULL, NULL);
-		if(log2vis)
-		{
-			len = fribidi_remove_bidi_marks (visual, len, NULL, NULL, NULL);
-			op = av_malloc(MAX(2*dst_length,2*len) + 1);
-		}
-		if (!op)
-		{
-			return line_in;
-		}
-
-	   size_t op_len = fribidi_unicode_to_charset(char_set_num, visual, len, op);
-	   op[op_len] = '\0';
-		return op;
-	}
-
-	return line_in;
-}
-
-#define BOM_CHECK_2(___bomp1___, ___bomp2___, ___bomname___)   \
-if ((bom[0]==___bomp1___ && bom[1]==___bomp2___ ) ||  \
-    (bom[0]==___bomp2___ && bom[1]==___bomp1___)){   \
-    fprintf(stderr, "Found %s BOM in subtitle. Ignoring\n", ___bomname___);                 \
-    lineoffset = 2;                                                         \
-}
-
-#define BOM_CHECK_3(___bomp1___, ___bomp2___, ___bomp3___, ___bomname___)   \
-if ((bom[0]==___bomp1___ && bom[1]==___bomp2___ && bom[2]==___bomp3___) ||  \
-    (bom[0]==___bomp3___ && bom[1]==___bomp2___ && bom[2]==___bomp1___)){   \
-    fprintf(stderr, "Found %s BOM in subtitle. Ignoring\n", ___bomname___);                 \
-    lineoffset = 3;                                                         \
-}
-
-#define BOM_CHECK_4(___bomp1___, ___bomp2___, ___bomp3___, ___bomp4___, ___bomname___)   \
-if ((bom[0]==___bomp1___ && bom[1]==___bomp2___ && bom[2]==___bomp3___ && bom[3]==___bomp4___) ||  \
-    (bom[0]==___bomp4___ && bom[1]==___bomp3___ && bom[2]==___bomp2___ && bom[3]==___bomp1___)){   \
-    fprintf(stderr, "Found %s BOM in subtitle. Ignoring\n", ___bomname___);                 \
-    lineoffset = 4;                                                         \
-}
-
-static ASS_Track *import_srt_file(AssContext *context)
-{
-    //fprintf(stderr, "----> loading %s\n", context->filename);
-	FILE *file = fopen(context->filename, "r");
-	if (!file)
-	{
-		return NULL;
-	}
-	//fprintf(stderr, "----> loaded %s\n", context->filename);
-	iconv_t conv = NULL;
-	if (context->srt_encoding &&
-		strcmp(context->srt_encoding, "UTF-8") != 0)
-	{
-		conv = iconv_open("UTF-8", context->srt_encoding);
-	}
-	
-	ASS_Track *track = ass_default_track(context->ass_library, context->frame_width, context->frame_height);
-	char *eventLine =
-		"[Events]\n"
-		"Format: EventIndex, Layer, Ignored, Start, End, Style, "
-		"Name, MarginL, MarginR, MarginV, Effect, Text\n";
-	ass_process_data(track, eventLine, strlen(eventLine));
-	
-    //handle Byteorder-Mark: http://de.wikipedia.org/wiki/Byte_Order_Mark
-	char *line = getlinewithopts(file, conv, 0);
-    const uint8_t *bom = (uint8_t*)line;
-    const int lineln = strlen(line);
-    //fprintf(stderr, "----> linelen=%i, 0x%x-0x%x-0x%x-0x%x\n", lineln, bom[0], bom[1], bom[2], bom[3]);
-    uint16_t lineoffset = 0;
-    if (lineln>=2){
-        BOM_CHECK_2(0xFE, 0xFF, "UTF-16");
-    }
-    if (lineln>=3){
-        BOM_CHECK_3(0xEF, 0xBB, 0xBF, "UTF-8");
-        BOM_CHECK_3(0xF7, 0x64, 0x4C, "UTF-1");
-        BOM_CHECK_3(0x0E, 0xFE, 0xFF, "SCSU");
-    }
-    if (lineln>=4){
-        BOM_CHECK_4(0x00, 0x00, 0xFE, 0xFF, "UTF-32");
-        BOM_CHECK_3(0x2B, 0x2F, 0x76, "UTF-7");
-        BOM_CHECK_4(0xDD, 0x73, 0x66, 0x73, "UTF-EBCDIC");
-        BOM_CHECK_3(0xFB, 0xEE, 0x28, "BOCU-1");
-        BOM_CHECK_4(0x84, 0x31, 0x95, 0x33, "GB 18030");
-    }
-    char* realline = line + lineoffset;
-    
-	while (realline != NULL && strlen(realline) != 0)
-	{
-		char *endp = NULL;
-		int subtitle_index = strtol(realline, &endp, 10);
-		
-		if (endp != realline + strlen(realline))
-		{
-			av_free(line);
-			line = getlinewithopts(file, conv, 0);
-            realline = line;
-			continue;
-		}
-		
-		av_free(line);
-		line = getlinewithopts(file, conv, 0);
-        realline = line;
-		
-		int startHour, startMinute, startSecond, startMilli,
-			endHour, endMinute, endSecond, endMilli;
-		if (sscanf(realline, "%02d:%02d:%02d,%03d --> %02d:%02d:%02d,%03d",
-			&startHour, &startMinute, &startSecond, &startMilli,
-			&endHour, &endMinute, &endSecond, &endMilli) != 8)
-		{
-			av_free(line);
-			line = getlinewithopts(file, conv, 0);
-            realline = line;
-			continue;
-		}
-		
-		av_free(line);
-		char *subtitle = getlinewithopts(file, conv, context->flip_srt);
-		//fprintf(stderr, "----> subtitle: >>%s<<\n", subtitle);
-		size_t subtitleLength = strlen(subtitle);
-		if (subtitleLength == 0)
-		{
-            //fprintf(stderr, "----> nothing to show here\n");
-            while (subtitleLength==0){
-                av_free(subtitle);
-                subtitle = getlinewithopts(file, conv, 0); // load the next index.
-                subtitleLength = strlen(realline);
-                //fprintf(stderr, "----> moving one one line\n");
-            }
-            line = subtitle;
-            realline = line;
-			continue;
-		}
-		
-		subtitle = av_realloc(subtitle, subtitleLength + 2);
-		subtitle[subtitleLength] = '\n';
-		subtitle[subtitleLength + 1] = '\0';
-		
-		int lineLength;
-		while ((lineLength = strlen(line = getlinewithopts(file, conv, context->flip_srt))) != 0)
-		{
-            realline = line;
-            //fprintf(stderr, "----> line: >>%s<<\n", realline);
-			subtitle = av_realloc(subtitle, subtitleLength + 1 + lineLength + 2);
-			memcpy(&subtitle[subtitleLength + 1], realline, lineLength + 1);
-			av_free(line);
-			
-			subtitleLength += lineLength + 1;
-			subtitle[subtitleLength] = '\n';
-			subtitle[subtitleLength + 1] = '\0';
-		}
-		av_free(line);
-		
-		size_t subtitleLengthIncNewline = subtitleLength + 1;
-        //fprintf(stderr, "----> subtitle2: >>%s<<\n", subtitle);
-		subtitle = parse_srt_tags(subtitle, &subtitleLengthIncNewline);
-		subtitleLength = subtitleLengthIncNewline - 1;
-        //fprintf(stderr, "----> subtitle3: >>%s<<\n", subtitle);
-		
-		char subtitleBuffer[512];
-		
-		// The "Ignored" parameter should not actually be present.
-		int wrote = snprintf(subtitleBuffer, 512, "%d,0,%1d:%02d:%02d.%02d,%1d:%02d:%02d.%02d,Default,NoName,0000,0000,0000,,",
-			subtitle_index, startHour, startMinute, startSecond, startMilli / 10, endHour, endMinute, endSecond, endMilli / 10);
-		if (subtitleLength + 1 > 512 - wrote)
-		{
-			subtitleLength = 512 - wrote - 1;
-		}
-		av_strlcpy(&subtitleBuffer[wrote], subtitle, subtitleLength + 1);
-        //fprintf(stderr, "----> subtitle4: >>%s<<\n", &subtitleBuffer[wrote]);
-		ass_process_chunk(track, subtitleBuffer, wrote + subtitleLength + 1,
-			startHour * 3600000 + startMinute * 60000 + startSecond * 1000 + startMilli,
-			(endHour - startHour) * 3600000 + (endMinute - startMinute) * 60000 + (endSecond - startSecond) * 1000 + (endMilli - startMilli));
-		
-		line = getlinewithopts(file, conv, 0);
-        realline = line;
-	}
-	av_free(line);
-	
-	return track;
+    ff_set_common_formats(ctx, ff_draw_supported_pixel_formats(0));
+    return 0;
 }
 
 static int config_input(AVFilterLink *link)
 {
-  //fprintf(stderr, "----> config_input\n");
-  AssContext *context = link->dst->priv;
+    AssContext *context = link->dst->priv;
+    ff_draw_init(&context->draw, link->format, 0);
 
-  context->frame_width = link->w;
-  context->frame_height = link->h;
+    ass_set_frame_size(context->renderer, link->w, link->h);
 
-  context->ass_library = ass_library_init();
+    ass_set_pixel_aspect(context->renderer, av_q2d(link->sample_aspect_ratio));
 
-  if ( !context->ass_library ) {
-    av_log(0, AV_LOG_ERROR, "ass_library_init() failed!\n");
-    return 1;
-  }
+    return 0;
+}
 
-  ass_set_fonts_dir(context->ass_library, NULL);
-  ass_set_extract_fonts(context->ass_library, 1);
-  ass_set_style_overrides(context->ass_library, NULL);
+// Bunch of nonsense from MPlayer
+#define COL_Y 0
+#define COL_U 1
+#define COL_V 2
+#define COL_C 3
+enum mp_csp {
+    MP_CSP_AUTO,
+    MP_CSP_BT_601,
+    MP_CSP_BT_709,
+    MP_CSP_SMPTE_240M,
+    MP_CSP_RGB,
+    MP_CSP_XYZ,
+    MP_CSP_YCGCO,
+    MP_CSP_COUNT
+};
 
-  context->ass_renderer = ass_renderer_init(context->ass_library);
-  if ( ! context->ass_renderer ) {
-    av_log(0, AV_LOG_ERROR, "ass_renderer_init() failed!\n");
-    return 1;
-  }
+// Any enum mp_csp value is a valid index (except MP_CSP_COUNT)
+extern const char *const mp_csp_names[MP_CSP_COUNT];
 
-  ass_set_frame_size(context->ass_renderer, link->w, link->h);
-  ass_set_margins(context->ass_renderer, context->margin, context->margin, context->margin, context->margin);
-  ass_set_use_margins(context->ass_renderer, 1);
-  ass_set_font_scale(context->ass_renderer, context->font_scale);
-  
-	  char *conf_path;
+enum mp_csp_levels {
+    MP_CSP_LEVELS_AUTO,
+    MP_CSP_LEVELS_TV,
+    MP_CSP_LEVELS_PC,
+    MP_CSP_LEVELS_COUNT,
+};
+// initializer for struct mp_csp_details that contains reasonable defaults
+#define MP_CSP_DETAILS_DEFAULTS {MP_CSP_BT_601, MP_CSP_LEVELS_TV, MP_CSP_LEVELS_PC}
 
-#ifdef WINDOWS
+struct mp_csp_details {
+    enum mp_csp format;
+    enum mp_csp_levels levels_in;      // encoded video
+    enum mp_csp_levels levels_out;     // output device
+};
 
-  // Windows.
-  char *lastSlash = strrchr(executable_path, '\\');
-  int length = (long)lastSlash - (long)executable_path;
-  asprintf(&conf_path, "%.*s\\%s", length, executable_path, "fonts-windows.conf");
+struct mp_csp_params {
+    struct mp_csp_details colorspace;
+    float brightness;
+    float contrast;
+    float hue;
+    float saturation;
+    float rgamma;
+    float ggamma;
+    float bgamma;
+    // texture_bits/input_bits is for rescaling fixed point input to range [0,1]
+    int texture_bits;
+    int input_bits;
+    // for scaling integer input and output (if 0, assume range [0,1])
+    int int_bits_in;
+    int int_bits_out;
+};
 
-  // Default font.
-  char* font_path;
-  asprintf(&font_path, "%.*s\\Resources\\%s", length, executable_path, "DejaVuUniversal.ttf");
-  ass_set_fonts(context->ass_renderer, font_path, "DejaVu Sans", 0, NULL, 0);
+#define MP_CSP_PARAMS_DEFAULTS {                                \
+    .colorspace = MP_CSP_DETAILS_DEFAULTS,                      \
+    .brightness = 0, .contrast = 1, .hue = 0, .saturation = 1,  \
+    .rgamma = 1, .ggamma = 1, .bgamma = 1,                      \
+    .texture_bits = 8, .input_bits = 8}
 
-#elif defined(__linux__)
+/* Fill in the Y, U, V vectors of a yuv2rgb conversion matrix
+ * based on the given luma weights of the R, G and B components (lr, lg, lb).
+ * lr+lg+lb is assumed to equal 1.
+ * This function is meant for colorspaces satisfying the following
+ * conditions (which are true for common YUV colorspaces):
+ * - The mapping from input [Y, U, V] to output [R, G, B] is linear.
+ * - Y is the vector [1, 1, 1].  (meaning input Y component maps to 1R+1G+1B)
+ * - U maps to a value with zero R and positive B ([0, x, y], y > 0;
+ *   i.e. blue and green only).
+ * - V maps to a value with zero B and positive R ([x, y, 0], x > 0;
+ *   i.e. red and green only).
+ * - U and V are orthogonal to the luma vector [lr, lg, lb].
+ * - The magnitudes of the vectors U and V are the minimal ones for which
+ *   the image of the set Y=[0...1],U=[-0.5...0.5],V=[-0.5...0.5] under the
+ *   conversion function will cover the set R=[0...1],G=[0...1],B=[0...1]
+ *   (the resulting matrix can be converted for other input/output ranges
+ *   outside this function).
+ * Under these conditions the given parameters lr, lg, lb uniquely
+ * determine the mapping of Y, U, V to R, G, B.
+ */
+static void luma_coeffs(float m[3][4], float lr, float lg, float lb)
+{
+    assert(fabs(lr+lg+lb - 1) < 1e-6);
+    m[0][0] = m[1][0] = m[2][0] = 1;
+    m[0][1] = 0;
+    m[1][1] = -2 * (1-lb) * lb/lg;
+    m[2][1] = 2 * (1-lb);
+    m[0][2] = 2 * (1-lr);
+    m[1][2] = -2 * (1-lr) * lr/lg;
+    m[2][2] = 0;
+    // Constant coefficients (m[x][3]) not set here
+}
 
-  // Linux.
-  char *lastSlash = strrchr(executable_path, '/');
-  int length = (long)lastSlash - (long)executable_path;
+/**
+ * \brief get the coefficients of the yuv -> rgb conversion matrix
+ * \param params struct specifying the properties of the conversion like
+ *  brightness, ...
+ * \param m array to store coefficients into
+ */
+static void mp_get_yuv2rgb_coeffs(struct mp_csp_params *params, float m[3][4])
+{
+    int format = params->colorspace.format;
+    if (format <= MP_CSP_AUTO || format >= MP_CSP_COUNT)
+        format = MP_CSP_BT_601;
+    int levels_in = params->colorspace.levels_in;
+    if (levels_in <= MP_CSP_LEVELS_AUTO || levels_in >= MP_CSP_LEVELS_COUNT)
+        levels_in = MP_CSP_LEVELS_TV;
 
-  // Configuration.
-  asprintf(&conf_path, "%.*s/%s", length, executable_path, "fonts.conf");
-	  
-  // Default font.
-  char* font_path;
-  asprintf(&font_path, "%.*s/%s", length, executable_path, "DejaVuUniversal.ttf");
-  ass_set_fonts(context->ass_renderer, font_path, "DejaVu Sans", 0, NULL, 0);
+    switch (format) {
+    case MP_CSP_BT_601:     luma_coeffs(m, 0.299,  0.587,  0.114 ); break;
+    case MP_CSP_BT_709:     luma_coeffs(m, 0.2126, 0.7152, 0.0722); break;
+    case MP_CSP_SMPTE_240M: luma_coeffs(m, 0.2122, 0.7013, 0.0865); break;
+    case MP_CSP_RGB: {
+        static const float ident[3][4] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
+        memcpy(m, ident, sizeof(ident));
+        levels_in = -1;
+        break;
+    }
+    case MP_CSP_XYZ: {
+        static const float xyz_to_rgb[3][4] = {
+            {3.2404542,  -1.5371385, -0.4985314},
+            {-0.9692660,  1.8760108,  0.0415560},
+            {0.0556434,  -0.2040259,  1.0572252},
+        };
+        memcpy(m, xyz_to_rgb, sizeof(xyz_to_rgb));
+        levels_in = -1;
+        break;
+    }
+    case MP_CSP_YCGCO: {
+        static const float ycgco_to_rgb[3][4] = {
+            {1,  -1,  1},
+            {1,   1,  0},
+            {1,  -1, -1},
+        };
+        memcpy(m, ycgco_to_rgb, sizeof(ycgco_to_rgb));
+        break;
+    }
+    default:
+        abort();
+    };
 
-  av_free(font_path);
+    // Hue is equivalent to rotating input [U, V] subvector around the origin.
+    // Saturation scales [U, V].
+    float huecos = params->saturation * cos(params->hue);
+    float huesin = params->saturation * sin(params->hue);
+    for (int i = 0; i < 3; i++) {
+        float u = m[i][COL_U];
+        m[i][COL_U] = huecos * u - huesin * m[i][COL_V];
+        m[i][COL_V] = huesin * u + huecos * m[i][COL_V];
+    }
 
-#else
+    assert(params->input_bits >= 8);
+    assert(params->texture_bits >= params->input_bits);
+    double s = (1 << (params->input_bits-8)) / ((1<<params->texture_bits)-1.);
+    // The values below are written in 0-255 scale
+    struct yuvlevels { double ymin, ymax, cmin, cmid; }
+        yuvlim =  { 16*s, 235*s, 16*s, 128*s },
+        yuvfull = {  0*s, 255*s,  1*s, 128*s },  // '1' for symmetry around 128
+        anyfull = {  0*s, 255*s, -255*s/2, 0 },
+        yuvlev;
+    switch (levels_in) {
+    case MP_CSP_LEVELS_TV: yuvlev = yuvlim; break;
+    case MP_CSP_LEVELS_PC: yuvlev = yuvfull; break;
+    case -1: yuvlev = anyfull; break;
+    default:
+        abort();
+    }
 
-  // Mac.
-  char *lastSlash = strrchr(executable_path, '/');
-  int length = (long)lastSlash - (long)executable_path;
-  asprintf(&conf_path, "%.*s/%s", length, executable_path, "fonts.conf");
-  
-  struct stat st;
-  if (stat("/Library/Fonts/Arial Unicode.ttf", &st) == 0)
-      ass_set_fonts(context->ass_renderer, "/Library/Fonts/Arial Unicode.ttf", "Arial", 0, NULL, 0);
-  else if (stat("/Library/Fonts/Arial.ttf", &st) == 0)
-      ass_set_fonts(context->ass_renderer, "/Library/Fonts/Arial.ttf", "Arial", 0, NULL, 0);
+    int levels_out = params->colorspace.levels_out;
+    if (levels_out <= MP_CSP_LEVELS_AUTO || levels_out >= MP_CSP_LEVELS_COUNT)
+        levels_out = MP_CSP_LEVELS_PC;
+    struct rgblevels { double min, max; }
+        rgblim =  { 16/255., 235/255. },
+        rgbfull = {      0,        1  },
+        rgblev;
+    switch (levels_out) {
+    case MP_CSP_LEVELS_TV: rgblev = rgblim; break;
+    case MP_CSP_LEVELS_PC: rgblev = rgbfull; break;
+    default:
+        abort();
+    }
 
-#endif
+    double ymul = (rgblev.max - rgblev.min) / (yuvlev.ymax - yuvlev.ymin);
+    double cmul = (rgblev.max - rgblev.min) / (yuvlev.cmid - yuvlev.cmin) / 2;
+    for (int i = 0; i < 3; i++) {
+        m[i][COL_Y] *= ymul;
+        m[i][COL_U] *= cmul;
+        m[i][COL_V] *= cmul;
+        // Set COL_C so that Y=umin,UV=cmid maps to RGB=min (black to black)
+        m[i][COL_C] = rgblev.min - m[i][COL_Y] * yuvlev.ymin
+                      -(m[i][COL_U] + m[i][COL_V]) * yuvlev.cmid;
+    }
 
-	av_free(conf_path);
+    // Brightness adds a constant to output R,G,B.
+    // Contrast scales Y around 1/2 (not 0 in this implementation).
+    for (int i = 0; i < 3; i++) {
+        m[i][COL_C] += params->brightness;
+        m[i][COL_Y] *= params->contrast;
+        m[i][COL_C] += (rgblev.max-rgblev.min) * (1 - params->contrast)/2;
+    }
 
-  if (context->filename)
-  {
-  	int filenameLength = strlen(context->filename);
-  	if (strncmp(&context->filename[filenameLength - 3], "srt", 3) == 0)
+    int in_bits = FFMAX(params->int_bits_in, 1);
+    int out_bits = FFMAX(params->int_bits_out, 1);
+    double in_scale = (1 << in_bits) - 1.0;
+    double out_scale = (1 << out_bits) - 1.0;
+    for (int i = 0; i < 3; i++) {
+        m[i][COL_C] *= out_scale; // constant is 1.0
+        for (int x = 0; x < 3; x++)
+            m[i][x] *= out_scale / in_scale;
+    }
+}
+
+static void mp_invert_yuv2rgb(float out[3][4], float in[3][4])
+{
+    float m00 = in[0][0], m01 = in[0][1], m02 = in[0][2], m03 = in[0][3],
+          m10 = in[1][0], m11 = in[1][1], m12 = in[1][2], m13 = in[1][3],
+          m20 = in[2][0], m21 = in[2][1], m22 = in[2][2], m23 = in[2][3];
+
+    // calculate the adjoint
+    out[0][0] =  (m11 * m22 - m21 * m12);
+    out[0][1] = -(m01 * m22 - m21 * m02);
+    out[0][2] =  (m01 * m12 - m11 * m02);
+    out[1][0] = -(m10 * m22 - m20 * m12);
+    out[1][1] =  (m00 * m22 - m20 * m02);
+    out[1][2] = -(m00 * m12 - m10 * m02);
+    out[2][0] =  (m10 * m21 - m20 * m11);
+    out[2][1] = -(m00 * m21 - m20 * m01);
+    out[2][2] =  (m00 * m11 - m10 * m01);
+
+    // calculate the determinant (as inverse == 1/det * adjoint,
+    // adjoint * m == identity * det, so this calculates the det)
+    float det = m00 * out[0][0] + m10 * out[0][1] + m20 * out[0][2];
+    det = 1.0f / det;
+
+    out[0][0] *= det;
+    out[0][1] *= det;
+    out[0][2] *= det;
+    out[1][0] *= det;
+    out[1][1] *= det;
+    out[1][2] *= det;
+    out[2][0] *= det;
+    out[2][1] *= det;
+    out[2][2] *= det;
+
+    // fix the constant coefficient
+    // rgb = M * yuv + C
+    // M^-1 * rgb = yuv + M^-1 * C
+    // yuv = M^-1 * rgb - M^-1 * C
+    //                  ^^^^^^^^^^
+    out[0][3] = -(out[0][0] * m03 + out[0][1] * m13 + out[0][2] * m23);
+    out[1][3] = -(out[1][0] * m03 + out[1][1] * m13 + out[1][2] * m23);
+    out[2][3] = -(out[2][0] * m03 + out[2][1] * m13 + out[2][2] * m23);
+}
+
+// Multiply the color in c with the given matrix.
+// c is {R, G, B} or {Y, U, V} (depending on input/output and matrix).
+// Output is clipped to the given number of bits.
+static void mp_map_int_color(float matrix[3][4], int clip_bits, int c[3])
+{
+    int in[3] = {c[0], c[1], c[2]};
+    for (int i = 0; i < 3; i++) {
+        double val = matrix[i][3];
+        for (int x = 0; x < 3; x++)
+            val += matrix[i][x] * in[x];
+        int ival = lrint(val);
+        c[i] = av_clip(ival, 0, (1 << clip_bits) - 1);
+    }
+}
+
+// Disgusting hack for (xy-)vsfilter color compatibility.
+// From mpv
+static void calculate_mangle_table(AssContext *ass, AVFrame *frame)
+{
+    int out_csp = av_frame_get_colorspace(frame);
+    int out_levels = av_frame_get_color_range(frame);
+    int csp = 0;
+    int levels = 0;
+    const ASS_Track *track = ass->track;
+    static const int ass_csp[] = {
+        [YCBCR_BT601_TV]        = MP_CSP_BT_601,
+        [YCBCR_BT601_PC]        = MP_CSP_BT_601,
+        [YCBCR_BT709_TV]        = MP_CSP_BT_709,
+        [YCBCR_BT709_PC]        = MP_CSP_BT_709,
+        [YCBCR_SMPTE240M_TV]    = MP_CSP_SMPTE_240M,
+        [YCBCR_SMPTE240M_PC]    = MP_CSP_SMPTE_240M,
+    };
+    static const int av_csp[] = {
+        [AVCOL_SPC_RGB]          = MP_CSP_RGB,
+        [AVCOL_SPC_BT709]        = MP_CSP_BT_601, // We do something dumb here for FFDraw compatibility
+        [AVCOL_SPC_UNSPECIFIED]  = MP_CSP_AUTO,
+        [AVCOL_SPC_FCC]          = MP_CSP_AUTO,
+        [AVCOL_SPC_BT470BG]      = MP_CSP_BT_601,
+        [AVCOL_SPC_SMPTE170M]    = MP_CSP_BT_601,
+        [AVCOL_SPC_SMPTE240M]    = MP_CSP_SMPTE_240M,
+    };
+    static const int ass_levels[] = {
+        [YCBCR_BT601_TV]        = MP_CSP_LEVELS_TV,
+        [YCBCR_BT601_PC]        = MP_CSP_LEVELS_PC,
+        [YCBCR_BT709_TV]        = MP_CSP_LEVELS_TV,
+        [YCBCR_BT709_PC]        = MP_CSP_LEVELS_PC,
+        [YCBCR_SMPTE240M_TV]    = MP_CSP_LEVELS_TV,
+        [YCBCR_SMPTE240M_PC]    = MP_CSP_LEVELS_PC,
+    };
+    static const int av_levels[] = {
+        [AVCOL_RANGE_UNSPECIFIED] = MP_CSP_LEVELS_AUTO,
+        [AVCOL_RANGE_MPEG]        = MP_CSP_LEVELS_TV,
+        [AVCOL_RANGE_JPEG]        = MP_CSP_LEVELS_PC,
+    };
+    int trackcsp = track->YCbCrMatrix;
+    // NONE is a bit random, but the intention is: don't modify colors.
+    if (trackcsp == YCBCR_NONE) {
+        ass->mangle_state = 2;
+        return;
+    }
+    if (trackcsp < sizeof(ass_csp) / sizeof(ass_csp[0]))
+        csp = ass_csp[trackcsp];
+    if (out_csp < sizeof(av_csp) / sizeof(av_csp[0]))
+        out_csp = av_csp[out_csp];
+    if (trackcsp < sizeof(ass_levels) / sizeof(ass_levels[0]))
+        levels = ass_levels[trackcsp];
+    if (out_levels < sizeof(av_levels) / sizeof(av_levels[0]))
+        out_levels = av_levels[out_levels];
+    if (trackcsp == YCBCR_DEFAULT) {
+        csp = MP_CSP_BT_601;
+        levels = MP_CSP_LEVELS_TV;
+    }
+    // Unknown colorspace (either YCBCR_UNKNOWN, or a valid value unknown to us)
+    if (!csp || !levels || !out_csp || !out_levels || out_csp == MP_CSP_AUTO ||
+        (csp == out_csp && levels == out_levels)) {
+        ass->mangle_state = 2;
+        return;
+    }
+
+    // Conversion that VSFilter would use
+    struct mp_csp_params vs_params = MP_CSP_PARAMS_DEFAULTS;
+    vs_params.colorspace.format = csp;
+    vs_params.colorspace.levels_in = levels;
+    vs_params.int_bits_in = 8;
+    vs_params.int_bits_out = 8;
+    float vs_yuv2rgb[3][4];
+    mp_get_yuv2rgb_coeffs(&vs_params, vs_yuv2rgb);
+    mp_invert_yuv2rgb(ass->vs_rgb2yuv, vs_yuv2rgb);
+
+    // Proper conversion to RGB
+    struct mp_csp_params rgb_params = MP_CSP_PARAMS_DEFAULTS;
+    rgb_params.colorspace.format = out_csp;
+    rgb_params.colorspace.levels_in = out_levels;
+    rgb_params.int_bits_in = 8;
+    rgb_params.int_bits_out = 8;
+    mp_get_yuv2rgb_coeffs(&rgb_params, ass->vs2rgb);
+
+    ass->mangle_state = 1;
+}
+
+/* libass stores an RGBA color in the format RRGGBBTT, where TT is the transparency level */
+#define AR(c)  ( (c)>>24)
+#define AG(c)  (((c)>>16)&0xFF)
+#define AB(c)  (((c)>>8) &0xFF)
+#define AA(c)  ((0xFF-c) &0xFF)
+
+static void overlay_ass_image(AssContext *ass, AVFrame *picref,
+                              const ASS_Image *image)
+{
+    uint8_t rgba_color[4];
+    for (; image; image = image->next) {
+        if (ass->mangle_state == 1) {
+            int c[3] = {AR(image->color), AG(image->color), AB(image->color)};
+            mp_map_int_color(ass->vs_rgb2yuv, 8, c);
+            mp_map_int_color(ass->vs2rgb, 8, c);
+
+            rgba_color[0] = c[0];
+            rgba_color[1] = c[1];
+            rgba_color[2] = c[2];
+            rgba_color[3] = AA(image->color);
+        } else {
+            rgba_color[0] = AR(image->color);
+            rgba_color[1] = AG(image->color);
+            rgba_color[2] = AB(image->color);
+            rgba_color[3] = AA(image->color);
+        }
+        FFDrawColor color;
+        ff_draw_color(&ass->draw, &color, rgba_color);
+        ff_blend_mask(&ass->draw, &color,
+                      picref->data, picref->linesize,
+                      picref->width, picref->height,
+                      image->bitmap, image->stride, image->w, image->h,
+                      3, 0, image->dst_x, image->dst_y);
+    }
+}
+
+static int filter_frame(AVFilterLink *inlink, AVFrame *picref)
+{
+    AVFilterContext *ctx = inlink->dst;
+    AVFilterLink *outlink = ctx->outputs[0];
+    AssContext *ass = ctx->priv;
+    ASS_Image *image = NULL;
+    long long time_ms = av_rescale_q(picref->pts, inlink->time_base, ASS_TIME_BASE);
+
+    if (!ass->mangle_state) {
+        calculate_mangle_table(ass, picref);
+    }
+
+    image = ass_render_frame(ass->renderer, ass->track, time_ms, NULL);
+
+    overlay_ass_image(ass, picref, image);
+
+    return ff_filter_frame(outlink, picref);
+}
+
+static const AVFilterPad inlineass_inputs[] = {
     {
-        context->ass_track = import_srt_file(context);
-    }
-    else
+        .name             = "default",
+        .type             = AVMEDIA_TYPE_VIDEO,
+        .filter_frame     = filter_frame,
+        .config_props     = config_input,
+        .needs_writable   = 1,
+    },
+    { NULL }
+};
+
+static const AVFilterPad inlineass_outputs[] = {
     {
-        context->ass_track = ass_read_file(context->ass_library, context->filename, context->encoding);
-    }
-  }
-  else
-  {
-      context->ass_track = ass_default_track(context->ass_library, context->frame_width, context->frame_height);
-  }
-  if ( !context->ass_track ) {
-    av_log(0, AV_LOG_ERROR, "Failed to read subtitle file with ass_read_file()!\n");
-    return 1;
-  }
+        .name = "default",
+        .type = AVMEDIA_TYPE_VIDEO,
+    },
+    { NULL }
+};
 
-  avcodec_get_chroma_sub_sample(link->format,
-				&context->hsub, &context->vsub);
-
-  return 0;
+void vf_inlineass_set_storage_size(AVFilterContext *context, int w, int h)
+{
+    AssContext *ass = (AssContext *)context->priv;
+    ass_set_storage_size(ass->renderer, w, h);
 }
 
-static void start_frame(AVFilterLink *link, AVFilterBufferRef *picref)
+void vf_inlineass_add_attachment(AVFilterContext *context, AVStream *st)
 {
-  //fprintf(stderr, "----> start_frame\n");
-  avfilter_start_frame(link->dst->outputs[0], picref);
+    AVDictionaryEntry *e = NULL;
+    char *filename = NULL, *ext = NULL;
+    AssContext *assContext = (AssContext *)context->priv;
+    if (!st->codec->extradata_size) {
+        return;
+    }
+    e = av_dict_get(st->metadata, "filename", NULL, 0);
+    if (!e) {
+        return; // Nobody adds fonts without filenames anyway
+    }
+    filename = e->value;
+    ext = filename + strlen(filename) - 4;
+    if (st->codec->codec_id == AV_CODEC_ID_TTF ||
+        st->codec->codec_id == AV_CODEC_ID_OTF ||
+        !av_strcasecmp( ext, ".ttf" ) ||
+        !av_strcasecmp( ext, ".otf" ) ||
+        !av_strcasecmp( ext, ".ttc" )
+    ) {
+        ass_add_font(assContext->library, filename, st->codec->extradata, st->codec->extradata_size);
+    }
 }
 
-#define _r(c)  ((c)>>24)
-#define _g(c)  (((c)>>16)&0xFF)
-#define _b(c)  (((c)>>8)&0xFF)
-#define _a(c)  ((c)&0xFF)
-#define rgba2y(c)  ( (( 263*_r(c)  + 516*_g(c) + 100*_b(c)) >> 10) + 16  )                                                                     
-#define rgba2u(c)  ( ((-152*_r(c) - 298*_g(c) + 450*_b(c)) >> 10) + 128 )                                                                      
-#define rgba2v(c)  ( (( 450*_r(c) - 376*_g(c) -  73*_b(c)) >> 10) + 128 )                                                                      
-
-static void draw_ass_image(AVFilterBufferRef *pic, ASS_Image *img, AssContext *context)
+void vf_inlineass_set_fonts(AVFilterContext *context)
 {
-  //fprintf(stderr, "----> draw_ass_image\n");
-  unsigned char *row[4];
-  unsigned char c_y = rgba2y(img->color);
-  unsigned char c_u = rgba2u(img->color);
-  unsigned char c_v = rgba2v(img->color);
-  unsigned char opacity = 255 - _a(img->color);
-  unsigned char *src;
-  int i, j;
-
-  unsigned char *bitmap = img->bitmap;
-  int bitmap_w = img->w;
-  int bitmap_h = img->h;
-  int dst_x = img->dst_x;
-  int dst_y = img->dst_y;
-
-  int channel;
-  int x,y;
-
-  src = bitmap;
-
-  for (i = 0; i < bitmap_h; ++i) {
-    y = dst_y + i;
-    if ( y >= pic->video->h )
-      break;
-
-    row[0] = pic->data[0] + y * pic->linesize[0];
-
-    for (channel = 1; channel < 3; channel++)
-      row[channel] = pic->data[channel] +
-	pic->linesize[channel] * (y>> context->vsub);
-
-    for (j = 0; j < bitmap_w; ++j) {
-      unsigned k = ((unsigned)src[j]) * opacity >> 8;
-
-      x = dst_x + j;
-      if ( y >= pic->video->w )
-	break;
-
-      row[0][x] = (k*c_y + (255-k)*row[0][x]) >> 8;
-      row[1][x >> context->hsub] = (k*c_u + (255-k)*row[1][x >> context->hsub]) >> 8;
-      row[2][x >> context->hsub] = (k*c_v + (255-k)*row[2][x >> context->hsub]) >> 8;
-    }
-
-    src += img->stride;
-  } 
+    AssContext* ass = context->priv;
+    ass_set_fonts(ass->renderer, ass->font_path, "DejaVu Sans", 1, ass->fc_file, 1);
 }
 
-static void end_frame(AVFilterLink *link)
+void vf_inlineass_process_header(AVFilterContext *link,
+                                 AVCodecContext *dec_ctx)
 {
-  AssContext *context = link->dst->priv;
-  AVFilterLink* output = link->dst->outputs[0];
-  AVFilterBufferRef *pic = link->cur_buf;
-  //fprintf(stderr, "ass img at: %f\n",  (pic->pts + context->pts_offset) * 1000.0 / AV_TIME_BASE);
-  //fprintf(stderr, "ass renderer 0x%x, track 0x%x\n", context->ass_renderer, context->ass_track);
-  ASS_Image* img = ass_render_frame(context->ass_renderer,
-				      context->ass_track,
-				      (pic->pts + context->pts_offset) * 1000.0 / AV_TIME_BASE,
-				      NULL);
+    AssContext *ass = link->priv;
+    ASS_Track *track = ass->track;
+    enum AVCodecID codecID = dec_ctx->codec_id;
 
-  while ( img ) {
-    //fprintf(stderr, "    draw\n");
-    draw_ass_image(pic, img, context);
-    img = img->next;
-  }
+    if (!track)
+        return;
 
-  avfilter_draw_slice(output, 0, pic->video->h, 1);
-  avfilter_end_frame(output);
-}
-
-static int parse_args(AVFilterContext *ctx, AssContext *context, const char* args)
-{
-  char *arg_copy = av_strdup(args);
-  char *strtok_arg = arg_copy;
-  char *param;
-
-  while ( param = strtok(strtok_arg, "|") ) {
-    char *tmp = param;
-    char *param_name;
-    char *param_value;
-
-    strtok_arg = NULL;
-
-    while ( *tmp && *tmp != ':' ) {
-      tmp++;
-    }
-
-    if ( param == tmp || ! *tmp ) {
-      av_log(ctx, AV_LOG_ERROR, "Error while parsing arguments - must be like 'param1:value1|param2:value2'\n");
-      return 1;
-    }
-
-    param_name = av_malloc(tmp - param + 1);
-    memset(param_name, 0, tmp - param + 1);
-    av_strlcpy(param_name, param, tmp-param +1);
-
-    tmp++;
-
-    if ( ! *tmp ) {
-      av_log(ctx, AV_LOG_ERROR, "Error while parsing arguments - parameter value cannot be empty\n");
-      return 1;
-    }
-
-    param_value = av_strdup(tmp);
-    if ( !strcmp("filename", param_name ) ) {
-      context->filename = av_strdup(param_value);
-    } else if ( !strcmp("pts_offset", param_name ) ) {
-      context->pts_offset = atoll(param_value);
-    } else if ( !strcmp("font_scale", param_name ) ) {
-      context->font_scale = atof(param_value);
-    } else if ( !strcmp("encoding", param_name ) ) {
-      context->srt_encoding = av_strdup(param_value);
-    } else if ( !strcmp("flip_srt", param_name ) ) {
-        context->flip_srt = atol(param_value);
-    } else if ( !strcmp("fps", param_name ) ) {
-        //nothing to do...
+    if (codecID == AV_CODEC_ID_ASS) {
+        ass_process_codec_private(track, dec_ctx->extradata,
+                                  dec_ctx->extradata_size);
     } else {
-      av_log(ctx, AV_LOG_WARNING, "Warning while parsing arguments - unsupported parameter '%s'\n", param_name);
-      //return 1;
-    }
-    av_free(param_name);
-    av_free(param_value);
-  }
+        AVDictionary *codec_opts = NULL;
+        ASS_Style *style = NULL;
+        int sid = 0;
+        const AVCodecDescriptor *dec_desc = avcodec_descriptor_get(codecID);
 
-  return 0;
+        if (!dec_desc || !(dec_desc->props & AV_CODEC_PROP_TEXT_SUB)) {
+            av_log(link, AV_LOG_ERROR,
+                   "Only text based subtitles are currently supported\n");
+            return;
+        }
+
+        ass->dec = avcodec_find_decoder(codecID);
+        if(avcodec_open2(dec_ctx, ass->dec, &codec_opts) < 0){
+            av_log(link, AV_LOG_ERROR,
+                   "avcodec_open2 failed\n");
+            ass->dec = NULL;
+            return;
+        }
+        /* Decode subtitles and push them into the renderer (libass) */
+        if (dec_ctx->subtitle_header)
+            ass_process_codec_private(track,
+                                      dec_ctx->subtitle_header,
+                                      dec_ctx->subtitle_header_size);
+
+        style = &ass->track->styles[sid];
+        if (!ass->track->n_styles) {
+            sid = ass_alloc_style(track);
+            style = &ass->track->styles[sid];
+            style->Name             = strdup("Default");
+            style->PrimaryColour    = 0xffffff00;
+            style->SecondaryColour  = 0x00ffff00;
+            style->OutlineColour    = 0x00000000;
+            style->BackColour       = 0x00000080;
+            style->Bold             = 200;
+            style->ScaleX           = 1.0;
+            style->ScaleY           = 1.0;
+            style->Spacing          = 0;
+            style->BorderStyle      = 1;
+            style->Outline          = 2;
+            style->Shadow           = 3;
+            style->Alignment        = 2;
+        }
+
+        style->FontName         = strdup("DejaVu Sans");
+        style->FontSize         = ass->font_size;
+        style->MarginL = style->MarginR = style->MarginV = ass->margin;
+
+        track->default_style = sid;
+    }
 }
 
-AVFilter avfilter_vf_inlineass=
-  {
-    .name      = "inlineass",
-    .priv_size = sizeof(AssContext),
-    .init      = init,
+void vf_inlineass_append_data(AVFilterContext *link, AVStream *stream,
+                              AVPacket *pkt)
+{
+    AVCodecContext *dec_ctx = stream->codec;
+    AssContext *ass = link->priv;
+    ASS_Track *track = ass->track;
+    enum AVCodecID codecID = dec_ctx->codec_id;
+    int64_t pts = av_rescale_q(pkt->pts, stream->time_base, ASS_TIME_BASE);
+    int64_t duration = av_rescale_q(pkt->convergence_duration ? pkt->convergence_duration : pkt->duration,
+                                    stream->time_base, ASS_TIME_BASE);
 
-    .query_formats   = query_formats,
-    .inputs    = (AVFilterPad[]) {{ .name            = "default",
-                                    .type            = AVMEDIA_TYPE_VIDEO,
-                                    .start_frame     = start_frame,
-                                    .end_frame       = end_frame,
-                                    .config_props    = config_input,
-                                    .min_perms       = AV_PERM_WRITE | AV_PERM_READ,
-                                    .rej_perms       = AV_PERM_REUSE | AV_PERM_REUSE2},
-                                  { .name = NULL}},
-    .outputs   = (AVFilterPad[]) {{ .name            = "default",
-                                    .type            = AVMEDIA_TYPE_VIDEO, },
-                                  { .name = NULL}},
+    if (codecID == AV_CODEC_ID_ASS) {
+        ass_process_chunk(track, pkt->data, pkt->size, pts, duration);
+    } else {
+        int ret;
+        if (ass->dec && pkt) {
+            int i, got_subtitle;
+            AVSubtitle sub = {0};
+            // Clamp PTS's to 0; avoids potential negative-timed subtitles
+            // which cause some interesting casting issues
+            if (pkt->pts < 0)
+                pkt->pts = 0;
+            if (pkt->dts < 0)
+                pkt->dts = 0;
+            ret = avcodec_decode_subtitle2(dec_ctx, &sub, &got_subtitle, pkt);
+            if (ret < 0) {
+                av_log(link, AV_LOG_WARNING, "Error decoding: %s (ignored)\n",
+                       av_err2str(ret));
+            } else if ((int32_t)sub.start_display_time < 0 || (int32_t)sub.end_display_time < 0) {
+                // We could still have the output subtitle have negative display times
+                // if the decoder ignores the PTS and instead looks at an embedded timestamp
+                av_log(link, AV_LOG_WARNING, "Subtitle had negative timestamps: %u, %u; ignoring\n",
+                       sub.start_display_time, sub.end_display_time);
+            } else if (got_subtitle) {
+                for (i = 0; i < sub.num_rects; i++) {
+                    char *ass_line = sub.rects[i]->ass;
+                    if (!ass_line)
+                        break;
+                    ass_process_data(ass->track, ass_line, strlen(ass_line));
+                }
+            }
+        }
+    }
+}
+
+static const AVOption inlineass_options[] = {
+    {"font_scale",     "font scale factor",                OFFSET(font_scale), AV_OPT_TYPE_DOUBLE, {.dbl = 1.0 }, 0.0f,      100.0f,   FLAGS},
+    {"font_path",      "path to default font",             OFFSET(font_path),  AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN,  CHAR_MAX, FLAGS},
+    {"font_size",      "default font size",                OFFSET(font_size),  AV_OPT_TYPE_DOUBLE, {.dbl = 18.0}, 0.0f,      100.0f,   FLAGS},
+    {"margin",         "default margin",                   OFFSET(margin),     AV_OPT_TYPE_INT64,  {.i64 = 20  }, INT64_MIN, INT64_MAX,FLAGS},
+    {"fonts_dir",      "directory to scan for fonts",      OFFSET(fonts_dir),  AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN,  CHAR_MAX, FLAGS},
+    {"fontconfig_file","fontconfig file to load",          OFFSET(fc_file),    AV_OPT_TYPE_STRING, {.str = NULL}, CHAR_MIN,  CHAR_MAX, FLAGS},
+    {NULL},
+};
+
+AVFILTER_DEFINE_CLASS(inlineass);
+
+AVFilter ff_vf_inlineass ={
+    .name          = "inlineass",
+    .description   = NULL_IF_CONFIG_SMALL("Render subtitles onto input video using the libass library."),
+    .priv_size     = sizeof(AssContext),
+    .priv_class    = &inlineass_class,
+    .init          = init,
+    .uninit        = uninit,
+    .query_formats = query_formats,
+    .inputs        = inlineass_inputs,
+    .outputs       = inlineass_outputs,
   };

@@ -24,17 +24,33 @@ typedef struct H264PlexContext
   uint8_t bs_type;
 } H264PlexContext;
 
-extern int find_next_nal_annexb(const uint8_t *src, int *p, int size);
+static int find_next_nal_annexb(const uint8_t *src, int *p, int size)
+{
+    int i = 0;
+    int j = *p;
+    for (;j<size;j++) {
+        uint8_t t = src[j];
+        if (i == 2) {
+            if (t == 1) {
+                *p = j + 1;
+                return src[j+1] & 0x1f;
+            } else if (t)
+                i = 0;
+        } else if (t == 0)
+            i++;
+        else
+            i = 0;
+    }
+    return 0;
+}
 
 static int ff_h264_plex_filter(AVBitStreamFilterContext *bsfc,
                                  AVCodecContext *avctx, const char *args,
-                                 uint8_t  **poutbuf, int *poutbuf_size,
+                                 uint8_t **poutbuf, int *poutbuf_size,
                                  const uint8_t *buf, int      buf_size,
                                  int keyframe)
 {
     H264PlexContext *ctx = bsfc->priv_data;
-    uint8_t spsbuf0[64], spsbuf1[64]; // should be big enough
-    uint32_t spslen = 0;
 
     *poutbuf = buf;
     *poutbuf_size = buf_size;

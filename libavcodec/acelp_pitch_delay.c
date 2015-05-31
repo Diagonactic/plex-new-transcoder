@@ -20,11 +20,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include "libavutil/common.h"
+#include "libavutil/float_dsp.h"
+#include "libavutil/libm.h"
 #include "libavutil/mathematics.h"
 #include "avcodec.h"
-#include "dsputil.h"
 #include "acelp_pitch_delay.h"
 #include "celp_math.h"
+#include "audiodsp.h"
 
 int ff_acelp_decode_8bit_to_1st_delay3(int ac_index)
 {
@@ -85,11 +88,11 @@ void ff_acelp_update_past_gain(
     if(erasure)
         quant_energy[0] = FFMAX(avg_gain >> log2_ma_pred_order, -10240) - 4096; // -10 and -4 in (5.10)
     else
-        quant_energy[0] = (6165 * ((ff_log2(gain_corr_factor) >> 2) - (13 << 13))) >> 13;
+        quant_energy[0] = (6165 * ((ff_log2_q15(gain_corr_factor) >> 2) - (13 << 13))) >> 13;
 }
 
 int16_t ff_acelp_decode_gain_code(
-    DSPContext *dsp,
+    AudioDSPContext *adsp,
     int gain_corr_factor,
     const int16_t* fc_v,
     int mr_energy,
@@ -105,9 +108,20 @@ int16_t ff_acelp_decode_gain_code(
     for(i=0; i<ma_pred_order; i++)
         mr_energy += quant_energy[i] * ma_prediction_coeff[i];
 
+#ifdef G729_BITEXACT
+    mr_energy += (((-6165LL * ff_log2(dsp->scalarproduct_int16(fc_v, fc_v, subframe_size, 0))) >> 3) & ~0x3ff);
+
+    mr_energy = (5439 * (mr_energy >> 15)) >> 8;           // (0.15) = (0.15) * (7.23)
+
+    return bidir_sal(
+               ((ff_exp2(mr_energy & 0x7fff) + 16) >> 5) * (gain_corr_factor >> 1),
+               (mr_energy >> 15) - 25
+           );
+#else
     mr_energy = gain_corr_factor * exp(M_LN10 / (20 << 23) * mr_energy) /
-                sqrt(dsp->scalarproduct_int16(fc_v, fc_v, subframe_size, 0));
+                sqrt(adsp->scalarproduct_int16(fc_v, fc_v, subframe_size));
     return mr_energy >> 12;
+#endif
 }
 
 float ff_amr_set_fixed_gain(float fixed_gain_factor, float fixed_mean_energy,
@@ -119,7 +133,7 @@ float ff_amr_set_fixed_gain(float fixed_gain_factor, float fixed_mean_energy,
     // Note 10^(0.05 * -10log(average x2)) = 1/sqrt((average x2)).
     float val = fixed_gain_factor *
         exp2f(M_LOG2_10 * 0.05 *
-              (ff_dot_productf(pred_table, prediction_error, 4) +
+              (avpriv_scalarproduct_float_c(pred_table, prediction_error, 4) +
                energy_mean)) /
         sqrtf(fixed_mean_energy);
 

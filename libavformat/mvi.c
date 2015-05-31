@@ -19,7 +19,11 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <inttypes.h>
+
+#include "libavutil/channel_layout.h"
 #include "avformat.h"
+#include "internal.h"
 
 #define MVI_FRAC_BITS 10
 
@@ -35,23 +39,23 @@ typedef struct MviDemuxContext {
     int video_frame_size;
 } MviDemuxContext;
 
-static int read_header(AVFormatContext *s, AVFormatParameters *ap)
+static int read_header(AVFormatContext *s)
 {
     MviDemuxContext *mvi = s->priv_data;
     AVIOContext *pb = s->pb;
     AVStream *ast, *vst;
     unsigned int version, frames_count, msecs_per_frame, player_version;
 
-    ast = av_new_stream(s, 0);
+    ast = avformat_new_stream(s, NULL);
     if (!ast)
         return AVERROR(ENOMEM);
 
-    vst = av_new_stream(s, 0);
+    vst = avformat_new_stream(s, NULL);
     if (!vst)
         return AVERROR(ENOMEM);
 
-    vst->codec->extradata_size = 2;
-    vst->codec->extradata = av_mallocz(2 + FF_INPUT_BUFFER_PADDING_SIZE);
+    if (ff_alloc_extradata(vst->codec, 2))
+        return AVERROR(ENOMEM);
 
     version                  = avio_r8(pb);
     vst->codec->extradata[0] = avio_r8(pb);
@@ -76,20 +80,29 @@ static int read_header(AVFormatContext *s, AVFormatParameters *ap)
         return AVERROR_INVALIDDATA;
     }
 
-    av_set_pts_info(ast, 64, 1, ast->codec->sample_rate);
+    avpriv_set_pts_info(ast, 64, 1, ast->codec->sample_rate);
     ast->codec->codec_type      = AVMEDIA_TYPE_AUDIO;
-    ast->codec->codec_id        = CODEC_ID_PCM_U8;
+    ast->codec->codec_id        = AV_CODEC_ID_PCM_U8;
     ast->codec->channels        = 1;
+    ast->codec->channel_layout  = AV_CH_LAYOUT_MONO;
     ast->codec->bits_per_coded_sample = 8;
     ast->codec->bit_rate        = ast->codec->sample_rate * 8;
 
-    av_set_pts_info(vst, 64, msecs_per_frame, 1000000);
+    avpriv_set_pts_info(vst, 64, msecs_per_frame, 1000000);
+    vst->avg_frame_rate    = av_inv_q(vst->time_base);
     vst->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    vst->codec->codec_id   = CODEC_ID_MOTIONPIXELS;
+    vst->codec->codec_id   = AV_CODEC_ID_MOTIONPIXELS;
 
     mvi->get_int = (vst->codec->width * vst->codec->height < (1 << 16)) ? avio_rl16 : avio_rl24;
 
     mvi->audio_frame_size   = ((uint64_t)mvi->audio_data_size << MVI_FRAC_BITS) / frames_count;
+    if (mvi->audio_frame_size <= 1 << MVI_FRAC_BITS - 1) {
+        av_log(s, AV_LOG_ERROR,
+               "Invalid audio_data_size (%"PRIu32") or frames_count (%u)\n",
+               mvi->audio_data_size, frames_count);
+        return AVERROR_INVALIDDATA;
+    }
+
     mvi->audio_size_counter = (ast->codec->sample_rate * 830 / mvi->audio_frame_size - 1) * mvi->audio_frame_size;
     mvi->audio_size_left    = mvi->audio_data_size;
 
@@ -125,9 +138,9 @@ static int read_packet(AVFormatContext *s, AVPacket *pkt)
 
 AVInputFormat ff_mvi_demuxer = {
     .name           = "mvi",
-    .long_name      = NULL_IF_CONFIG_SMALL("Motion Pixels MVI format"),
+    .long_name      = NULL_IF_CONFIG_SMALL("Motion Pixels MVI"),
     .priv_data_size = sizeof(MviDemuxContext),
     .read_header    = read_header,
     .read_packet    = read_packet,
-    .extensions = "mvi"
+    .extensions     = "mvi",
 };

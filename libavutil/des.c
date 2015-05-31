@@ -286,7 +286,7 @@ static uint64_t des_encdec(uint64_t in, uint64_t K[16], int decrypt) {
     return in;
 }
 
-int av_des_init(AVDES *d, const uint8_t *key, int key_bits, int decrypt) {
+int av_des_init(AVDES *d, const uint8_t *key, int key_bits, av_unused int decrypt) {
     if (key_bits != 64 && key_bits != 192)
         return -1;
     d->triple_des = key_bits > 64;
@@ -298,7 +298,7 @@ int av_des_init(AVDES *d, const uint8_t *key, int key_bits, int decrypt) {
     return 0;
 }
 
-void av_des_crypt(AVDES *d, uint8_t *dst, const uint8_t *src, int count, uint8_t *iv, int decrypt) {
+static void av_des_crypt_mac(AVDES *d, uint8_t *dst, const uint8_t *src, int count, uint8_t *iv, int decrypt, int mac) {
     uint64_t iv_val = iv ? AV_RB64(iv) : 0;
     while (count-- > 0) {
         uint64_t dst_val;
@@ -321,19 +321,27 @@ void av_des_crypt(AVDES *d, uint8_t *dst, const uint8_t *src, int count, uint8_t
         }
         AV_WB64(dst, dst_val);
         src += 8;
-        dst += 8;
+        if (!mac)
+            dst += 8;
     }
     if (iv)
         AV_WB64(iv, iv_val);
 }
 
+void av_des_crypt(AVDES *d, uint8_t *dst, const uint8_t *src, int count, uint8_t *iv, int decrypt) {
+    av_des_crypt_mac(d, dst, src, count, iv, decrypt, 0);
+}
+
+void av_des_mac(AVDES *d, uint8_t *dst, const uint8_t *src, int count) {
+    av_des_crypt_mac(d, dst, src, count, (uint8_t[8]){0}, 0, 1);
+}
+
 #ifdef TEST
-#undef printf
-#undef rand
-#undef srand
 #include <stdlib.h>
 #include <stdio.h>
-#include <sys/time.h>
+
+#include "time.h"
+
 static uint64_t rand64(void) {
     uint64_t r = rand();
     r = (r << 32) | rand();
@@ -380,13 +388,11 @@ int main(void) {
 #ifdef GENTABLES
     int j;
 #endif
-    struct timeval tv;
     uint64_t key[3];
     uint64_t data;
     uint64_t ct;
     uint64_t roundkeys[16];
-    gettimeofday(&tv, NULL);
-    srand(tv.tv_sec * 1000 * 1000 + tv.tv_usec);
+    srand(av_gettime());
     key[0] = AV_RB64(test_key);
     data = AV_RB64(plain);
     gen_roundkeys(roundkeys, key[0]);
@@ -407,10 +413,10 @@ int main(void) {
     for (i = 0; i < 1000; i++) {
         key[0] = rand64(); key[1] = rand64(); key[2] = rand64();
         data = rand64();
-        av_des_init(&d, key, 192, 0);
-        av_des_crypt(&d, &ct, &data, 1, NULL, 0);
-        av_des_init(&d, key, 192, 1);
-        av_des_crypt(&d, &ct, &ct, 1, NULL, 1);
+        av_des_init(&d, (uint8_t*)key, 192, 0);
+        av_des_crypt(&d, (uint8_t*)&ct, (uint8_t*)&data, 1, NULL, 0);
+        av_des_init(&d, (uint8_t*)key, 192, 1);
+        av_des_crypt(&d, (uint8_t*)&ct, (uint8_t*)&ct, 1, NULL, 1);
         if (ct != data) {
             printf("Test 2 failed\n");
             return 1;

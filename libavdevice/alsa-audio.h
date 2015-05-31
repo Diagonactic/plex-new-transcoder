@@ -33,29 +33,31 @@
 #include <alsa/asoundlib.h>
 #include "config.h"
 #include "libavutil/log.h"
-#include "libavformat/timefilter.h"
+#include "timefilter.h"
 #include "avdevice.h"
 
 /* XXX: we make the assumption that the soundcard accepts this format */
 /* XXX: find better solution with "preinit" method, needed also in
         other formats */
-#define DEFAULT_CODEC_ID AV_NE(CODEC_ID_PCM_S16BE, CODEC_ID_PCM_S16LE)
+#define DEFAULT_CODEC_ID AV_NE(AV_CODEC_ID_PCM_S16BE, AV_CODEC_ID_PCM_S16LE)
 
 typedef void (*ff_reorder_func)(const void *, void *, int);
 
-#define ALSA_BUFFER_SIZE_MAX 32768
+#define ALSA_BUFFER_SIZE_MAX 65536
 
-typedef struct {
+typedef struct AlsaData {
     AVClass *class;
     snd_pcm_t *h;
     int frame_size;  ///< bytes per sample * channels
     int period_size; ///< preferred size for reads and writes, in frames
     int sample_rate; ///< sample rate set by user
     int channels;    ///< number of channels set by user
+    int last_period;
     TimeFilter *timefilter;
     void (*reorder_func)(const void *, void *, int);
     void *reorder_buf;
     int reorder_buf_size; ///< in frames
+    int64_t timestamp; ///< current timestamp, without latency applied.
 } AlsaData;
 
 /**
@@ -66,15 +68,15 @@ typedef struct {
  * @param sample_rate in: requested sample rate;
  *                    out: actually selected sample rate
  * @param channels number of channels
- * @param codec_id in: requested CodecID or CODEC_ID_NONE;
- *                 out: actually selected CodecID, changed only if
- *                 CODEC_ID_NONE was requested
+ * @param codec_id in: requested AVCodecID or AV_CODEC_ID_NONE;
+ *                 out: actually selected AVCodecID, changed only if
+ *                 AV_CODEC_ID_NONE was requested
  *
  * @return 0 if OK, AVERROR_xxx on error
  */
 int ff_alsa_open(AVFormatContext *s, snd_pcm_stream_t mode,
                  unsigned int *sample_rate,
-                 int channels, enum CodecID *codec_id);
+                 int channels, enum AVCodecID *codec_id);
 
 /**
  * Close the ALSA PCM.
@@ -96,5 +98,7 @@ int ff_alsa_close(AVFormatContext *s1);
 int ff_alsa_xrun_recover(AVFormatContext *s1, int err);
 
 int ff_alsa_extend_reorder_buf(AlsaData *s, int size);
+
+int ff_alsa_get_device_list(AVDeviceInfoList *device_list, snd_pcm_stream_t stream_type);
 
 #endif /* AVDEVICE_ALSA_AUDIO_H */

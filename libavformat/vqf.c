@@ -20,9 +20,11 @@
  */
 
 #include "avformat.h"
+#include "internal.h"
 #include "libavutil/intreadwrite.h"
 #include "libavutil/dict.h"
 #include "libavutil/mathematics.h"
+#include "riff.h"
 
 typedef struct VqfContext {
     int frame_bit_len;
@@ -41,14 +43,17 @@ static int vqf_probe(AVProbeData *probe_packet)
     if (!memcmp(probe_packet->buf + 4, "00052200", 8))
         return AVPROBE_SCORE_MAX;
 
-    return AVPROBE_SCORE_MAX/2;
+    if (AV_RL32(probe_packet->buf + 12) > (1<<27))
+        return AVPROBE_SCORE_EXTENSION/2;
+
+    return AVPROBE_SCORE_EXTENSION;
 }
 
-static void add_metadata(AVFormatContext *s, const char *tag,
+static void add_metadata(AVFormatContext *s, uint32_t tag,
                          unsigned int tag_len, unsigned int remaining)
 {
     int len = FFMIN(tag_len, remaining);
-    char *buf;
+    char *buf, key[5] = {0};
 
     if (len == UINT_MAX)
         return;
@@ -58,18 +63,42 @@ static void add_metadata(AVFormatContext *s, const char *tag,
         return;
     avio_read(s->pb, buf, len);
     buf[len] = 0;
-    av_dict_set(&s->metadata, tag, buf, AV_DICT_DONT_STRDUP_VAL);
+    AV_WL32(key, tag);
+    av_dict_set(&s->metadata, key, buf, AV_DICT_DONT_STRDUP_VAL);
 }
 
-static int vqf_read_header(AVFormatContext *s, AVFormatParameters *ap)
+static const AVMetadataConv vqf_metadata_conv[] = {
+    { "(c) ", "copyright" },
+    { "ARNG", "arranger"  },
+    { "AUTH", "author"    },
+    { "BAND", "band"      },
+    { "CDCT", "conductor" },
+    { "COMT", "comment"   },
+    { "FILE", "filename"  },
+    { "GENR", "genre"     },
+    { "LABL", "publisher" },
+    { "MUSC", "composer"  },
+    { "NAME", "title"     },
+    { "NOTE", "note"      },
+    { "PROD", "producer"  },
+    { "PRSN", "personnel" },
+    { "REMX", "remixer"   },
+    { "SING", "singer"    },
+    { "TRCK", "track"     },
+    { "WORD", "words"     },
+    { 0 },
+};
+
+static int vqf_read_header(AVFormatContext *s)
 {
     VqfContext *c = s->priv_data;
-    AVStream *st  = av_new_stream(s, 0);
+    AVStream *st  = avformat_new_stream(s, NULL);
     int chunk_tag;
     int rate_flag = -1;
     int header_size;
     int read_bitrate = 0;
     int size;
+    uint8_t comm_chunk[12];
 
     if (!st)
         return AVERROR(ENOMEM);
@@ -79,7 +108,7 @@ static int vqf_read_header(AVFormatContext *s, AVFormatParameters *ap)
     header_size = avio_rb32(s->pb);
 
     st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-    st->codec->codec_id   = CODEC_ID_TWINVQ;
+    st->codec->codec_id   = AV_CODEC_ID_TWINVQ;
     st->start_time = 0;
 
     do {
@@ -100,55 +129,40 @@ static int vqf_read_header(AVFormatContext *s, AVFormatParameters *ap)
 
         switch(chunk_tag){
         case MKTAG('C','O','M','M'):
-            st->codec->channels = avio_rb32(s->pb) + 1;
-            read_bitrate        = avio_rb32(s->pb);
-            rate_flag           = avio_rb32(s->pb);
+            avio_read(s->pb, comm_chunk, 12);
+            st->codec->channels = AV_RB32(comm_chunk    ) + 1;
+            read_bitrate        = AV_RB32(comm_chunk + 4);
+            rate_flag           = AV_RB32(comm_chunk + 8);
             avio_skip(s->pb, len-12);
 
+            if (st->codec->channels <= 0) {
+                av_log(s, AV_LOG_ERROR, "Invalid number of channels\n");
+                return AVERROR_INVALIDDATA;
+            }
+
             st->codec->bit_rate              = read_bitrate*1000;
-            st->codec->bits_per_coded_sample = 16;
             break;
-        case MKTAG('N','A','M','E'):
-            add_metadata(s, "title"    , len, header_size);
+        case MKTAG('D','S','I','Z'): // size of compressed data
+        {
+            av_dict_set_int(&s->metadata, "size", avio_rb32(s->pb), 0);
+        }
             break;
-        case MKTAG('(','c',')',' '):
-            add_metadata(s, "copyright", len, header_size);
-            break;
-        case MKTAG('A','U','T','H'):
-            add_metadata(s, "author"   , len, header_size);
-            break;
-        case MKTAG('A','L','B','M'):
-            add_metadata(s, "album"    , len, header_size);
-            break;
-        case MKTAG('T','R','C','K'):
-            add_metadata(s, "track"    , len, header_size);
-            break;
-        case MKTAG('C','O','M','T'):
-            add_metadata(s, "comment"  , len, header_size);
-            break;
-        case MKTAG('F','I','L','E'):
-            add_metadata(s, "filename" , len, header_size);
-            break;
-        case MKTAG('D','S','I','Z'):
-            add_metadata(s, "size"     , len, header_size);
-            break;
-        case MKTAG('D','A','T','E'):
-            add_metadata(s, "date"     , len, header_size);
-            break;
-        case MKTAG('G','E','N','R'):
-            add_metadata(s, "genre"    , len, header_size);
+        case MKTAG('Y','E','A','R'): // recording date
+        case MKTAG('E','N','C','D'): // compression date
+        case MKTAG('E','X','T','R'): // reserved
+        case MKTAG('_','Y','M','H'): // reserved
+        case MKTAG('_','N','T','T'): // reserved
+        case MKTAG('_','I','D','3'): // reserved for ID3 tags
+            avio_skip(s->pb, FFMIN(len, header_size));
             break;
         default:
-            av_log(s, AV_LOG_ERROR, "Unknown chunk: %c%c%c%c\n",
-                   ((char*)&chunk_tag)[0], ((char*)&chunk_tag)[1],
-                   ((char*)&chunk_tag)[2], ((char*)&chunk_tag)[3]);
-            avio_skip(s->pb, FFMIN(len, header_size));
+            add_metadata(s, chunk_tag, len, header_size);
             break;
         }
 
         header_size -= len;
 
-    } while (header_size >= 0);
+    } while (header_size >= 0 && !avio_feof(s->pb));
 
     switch (rate_flag) {
     case -1:
@@ -164,8 +178,19 @@ static int vqf_read_header(AVFormatContext *s, AVFormatParameters *ap)
         st->codec->sample_rate = 11025;
         break;
     default:
+        if (rate_flag < 8 || rate_flag > 44) {
+            av_log(s, AV_LOG_ERROR, "Invalid rate flag %d\n", rate_flag);
+            return AVERROR_INVALIDDATA;
+        }
         st->codec->sample_rate = rate_flag*1000;
         break;
+    }
+
+    if (read_bitrate / st->codec->channels <  8 ||
+        read_bitrate / st->codec->channels > 48) {
+        av_log(s, AV_LOG_ERROR, "Invalid bitrate per channel %d\n",
+               read_bitrate / st->codec->channels);
+        return AVERROR_INVALIDDATA;
     }
 
     switch (((st->codec->sample_rate/1000) << 8) +
@@ -191,7 +216,14 @@ static int vqf_read_header(AVFormatContext *s, AVFormatParameters *ap)
         return -1;
     }
     c->frame_bit_len = st->codec->bit_rate*size/st->codec->sample_rate;
-    av_set_pts_info(st, 64, 1, st->codec->sample_rate);
+    avpriv_set_pts_info(st, 64, size, st->codec->sample_rate);
+
+    /* put first 12 bytes of COMM chunk in extradata */
+    if (ff_alloc_extradata(st->codec, 12))
+        return AVERROR(ENOMEM);
+    memcpy(st->codec->extradata, comm_chunk, 12);
+
+    ff_metadata_conv_ctx(s, NULL, vqf_metadata_conv);
 
     return 0;
 }
@@ -202,17 +234,18 @@ static int vqf_read_packet(AVFormatContext *s, AVPacket *pkt)
     int ret;
     int size = (c->frame_bit_len - c->remaining_bits + 7)>>3;
 
-    pkt->pos          = avio_tell(s->pb);
-    pkt->stream_index = 0;
-
     if (av_new_packet(pkt, size+2) < 0)
         return AVERROR(EIO);
+
+    pkt->pos          = avio_tell(s->pb);
+    pkt->stream_index = 0;
+    pkt->duration     = 1;
 
     pkt->data[0] = 8 - c->remaining_bits; // Number of bits to skip
     pkt->data[1] = c->last_frame_bits;
     ret = avio_read(s->pb, pkt->data+2, size);
 
-    if (ret<=0) {
+    if (ret != size) {
         av_free_packet(pkt);
         return AVERROR(EIO);
     }
@@ -257,5 +290,5 @@ AVInputFormat ff_vqf_demuxer = {
     .read_header    = vqf_read_header,
     .read_packet    = vqf_read_packet,
     .read_seek      = vqf_read_seek,
-    .extensions = "vqf",
+    .extensions     = "vqf,vql,vqe",
 };

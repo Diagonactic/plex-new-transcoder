@@ -19,6 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 #include "avformat.h"
+#include "internal.h"
 
 typedef struct RCVContext {
     int frames;
@@ -29,7 +30,7 @@ static int vc1test_write_header(AVFormatContext *s)
     AVCodecContext *avc = s->streams[0]->codec;
     AVIOContext *pb = s->pb;
 
-    if (avc->codec_id != CODEC_ID_WMV3) {
+    if (avc->codec_id != AV_CODEC_ID_WMV3) {
         av_log(s, AV_LOG_ERROR, "Only WMV3 is accepted!\n");
         return -1;
     }
@@ -43,11 +44,11 @@ static int vc1test_write_header(AVFormatContext *s)
     avio_wl24(pb, 0); // hrd_buffer
     avio_w8(pb, 0x80); // level|cbr|res1
     avio_wl32(pb, 0); // hrd_rate
-    if (s->streams[0]->r_frame_rate.den && s->streams[0]->r_frame_rate.num == 1)
-        avio_wl32(pb, s->streams[0]->r_frame_rate.den);
+    if (s->streams[0]->avg_frame_rate.den && s->streams[0]->avg_frame_rate.num == 1)
+        avio_wl32(pb, s->streams[0]->avg_frame_rate.den);
     else
         avio_wl32(pb, 0xFFFFFFFF); //variable framerate
-    av_set_pts_info(s->streams[0], 32, 1, 1000);
+    avpriv_set_pts_info(s->streams[0], 32, 1, 1000);
 
     return 0;
 }
@@ -62,7 +63,6 @@ static int vc1test_write_packet(AVFormatContext *s, AVPacket *pkt)
     avio_wl32(pb, pkt->size | ((pkt->flags & AV_PKT_FLAG_KEY) ? 0x80000000 : 0));
     avio_wl32(pb, pkt->pts);
     avio_write(pb, pkt->data, pkt->size);
-    avio_flush(pb);
     ctx->frames++;
 
     return 0;
@@ -82,13 +82,12 @@ static int vc1test_write_trailer(AVFormatContext *s)
 }
 
 AVOutputFormat ff_vc1t_muxer = {
-    .name              = "rcv",
+    .name              = "vc1test",
     .long_name         = NULL_IF_CONFIG_SMALL("VC-1 test bitstream"),
-    .mime_type         = "",
     .extensions        = "rcv",
     .priv_data_size    = sizeof(RCVContext),
-    .audio_codec       = CODEC_ID_NONE,
-    .video_codec       = CODEC_ID_WMV3,
+    .audio_codec       = AV_CODEC_ID_NONE,
+    .video_codec       = AV_CODEC_ID_WMV3,
     .write_header      = vc1test_write_header,
     .write_packet      = vc1test_write_packet,
     .write_trailer     = vc1test_write_trailer,

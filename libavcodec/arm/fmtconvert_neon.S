@@ -20,10 +20,7 @@
  */
 
 #include "config.h"
-#include "asm.S"
-
-        preserve8
-        .text
+#include "libavutil/arm/asm.S"
 
 function ff_float_to_int16_neon, export=1
         subs            r2,  r2,  #8
@@ -73,7 +70,7 @@ function ff_float_to_int16_interleave_neon, export=1
         cmp             r3, #2
         itt             lt
         ldrlt           r1, [r1]
-        blt             ff_float_to_int16_neon
+        blt             X(ff_float_to_int16_neon)
         bne             4f
 
         ldr             r3, [r1]

@@ -25,8 +25,32 @@
 
 #include <stdint.h>
 
+typedef struct ACELPVContext {
+    /**
+     * float implementation of weighted sum of two vectors.
+     * @param[out] out result of addition
+     * @param in_a first vector
+     * @param in_b second vector
+     * @param weight_coeff_a first vector weight coefficient
+     * @param weight_coeff_a second vector weight coefficient
+     * @param length vectors length (should be a multiple of two)
+     *
+     * @note It is safe to pass the same buffer for out and in_a or in_b.
+     */
+    void (*weighted_vector_sumf)(float *out, const float *in_a, const float *in_b,
+                                 float weight_coeff_a, float weight_coeff_b,
+                                 int length);
+
+}ACELPVContext;
+
+/**
+ * Initialize ACELPVContext.
+ */
+void ff_acelp_vectors_init(ACELPVContext *c);
+void ff_acelp_vectors_init_mips(ACELPVContext *c);
+
 /** Sparse representation for the algebraic codebook (fixed) vector */
-typedef struct {
+typedef struct AMRFixed {
     int      n;
     int      x[10];
     float    y[10];
@@ -80,6 +104,37 @@ extern const uint8_t ff_fc_4pulses_8bits_track_4[32];
  */
 extern const uint8_t ff_fc_2pulses_9bits_track1[16];
 extern const uint8_t ff_fc_2pulses_9bits_track1_gray[16];
+
+/**
+ * Track|Pulse|        Positions
+ * -----------------------------------------
+ *  2   | 1   | 0, 7, 14, 20, 27, 34,  1, 21
+ *      |     | 2, 9, 15, 22, 29, 35,  6, 26
+ *      |     | 4,10, 17, 24, 30, 37, 11, 31
+ *      |     | 5,12, 19, 25, 32, 39, 16, 36
+ * -----------------------------------------
+ *
+ * @remark Track in the table should be read top-to-bottom, left-to-right.
+ *
+ * @note (EE.1) This table (from the reference code) does not comply with
+ *              the specification.
+ *              The specification contains the following table:
+ *
+ * Track|Pulse|        Positions
+ * -----------------------------------------
+ *  2   | 1   | 0, 5, 10, 15, 20, 25, 30, 35
+ *      |     | 1, 6, 11, 16, 21, 26, 31, 36
+ *      |     | 2, 7, 12, 17, 22, 27, 32, 37
+ *      |     | 4, 9, 14, 19, 24, 29, 34, 39
+ *
+ * -----------------------------------------
+ *
+ * @note (EE.2) Reference G.729D code also uses gray decoding for each
+ *              pulse index before looking up the value in the table.
+ *
+ * Used in G.729 @@6.4k (with gray coding)
+ */
+extern const uint8_t ff_fc_2pulses_9bits_track2_gray[32];
 
 /**
  * b60 hamming windowed sinc function coefficients

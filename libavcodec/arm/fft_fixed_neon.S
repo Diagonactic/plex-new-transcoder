@@ -1,24 +1,24 @@
 /*
  * Copyright (c) 2011 Mans Rullgard <mans@mansr.com>
  *
- * This file is part of Libav.
+ * This file is part of FFmpeg.
  *
- * Libav is free software; you can redistribute it and/or
+ * FFmpeg is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
  * version 2.1 of the License, or (at your option) any later version.
  *
- * Libav is distributed in the hope that it will be useful,
+ * FFmpeg is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
  * Lesser General Public License for more details.
  *
  * You should have received a copy of the GNU Lesser General Public
- * License along with Libav; if not, write to the Free Software
+ * License along with FFmpeg; if not, write to the Free Software
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "asm.S"
+#include "libavutil/arm/asm.S"
 
 .macro  bflies          d0,  d1,  r0,  r1
         vrev64.32       \r0, \d1                @ t5, t6, t1, t2
@@ -122,7 +122,7 @@ endfunc
 
 function fft_pass_neon
         push            {r4,lr}
-        movrel          lr,  coefs+24
+        movrel          lr,  coefs + 24
         vld1.16         {d30},    [lr,:64]
         lsl             r12, r2,  #3
         vmov            d31, d30
@@ -214,7 +214,7 @@ function fft\n\()_neon
         bl              fft\n4\()_neon
         mov             r0,  r4
         pop             {r4, lr}
-        movrel          r1,  X(ff_cos_\n\()_fixed)
+        movrelx         r1,  X(ff_cos_\n\()_fixed)
         mov             r2,  #\n4/2
         b               fft_pass_neon
 endfunc

@@ -1,4 +1,4 @@
-/**
+/*
  * LPC utility code
  * Copyright (c) 2006  Justin Ruggles <justin.ruggles@gmail.com>
  *
@@ -23,7 +23,8 @@
 #define AVCODEC_LPC_H
 
 #include <stdint.h>
-#include "dsputil.h"
+#include "libavutil/avassert.h"
+#include "libavutil/lls.h"
 
 #define ORDER_METHOD_EST     0
 #define ORDER_METHOD_2LEVEL  1
@@ -51,6 +52,7 @@ typedef struct LPCContext {
     int blocksize;
     int max_order;
     enum FFLPCType lpc_type;
+    double *windowed_buffer;
     double *windowed_samples;
 
     /**
@@ -66,8 +68,8 @@ typedef struct LPCContext {
     /**
      * Perform autocorrelation on input samples with delay of 0 to lag.
      * @param data  input samples.
-     *              constraints: no alignment needed, but must have have at
-     *              least lag*sizeof(double) valid bytes preceeding it, and
+     *              constraints: no alignment needed, but must have at
+     *              least lag*sizeof(double) valid bytes preceding it, and
      *              size must be at least (len+1)*sizeof(double) if data is
      *              16-byte aligned or (len+2)*sizeof(double) if data is
      *              unaligned.
@@ -78,6 +80,9 @@ typedef struct LPCContext {
      */
     void (*lpc_compute_autocorr)(const double *data, int len, int lag,
                                  double *autoc);
+
+    // TODO: these should be allocated to reduce ABI compatibility issues
+    LLSModel lls_models[2];
 } LPCContext;
 
 
@@ -90,6 +95,9 @@ int ff_lpc_calc_coefs(LPCContext *s,
                       int32_t coefs[][MAX_LPC_ORDER], int *shift,
                       enum FFLPCType lpc_type, int lpc_passes,
                       int omethod, int max_shift, int zero_shift);
+
+int ff_lpc_calc_ref_coefs(LPCContext *s,
+                          const int32_t *samples, int order, double *ref);
 
 /**
  * Initialize LPCContext.
@@ -110,6 +118,37 @@ void ff_lpc_end(LPCContext *s);
 #endif
 
 /**
+ * Schur recursion.
+ * Produces reflection coefficients from autocorrelation data.
+ */
+static inline void compute_ref_coefs(const LPC_TYPE *autoc, int max_order,
+                                     LPC_TYPE *ref, LPC_TYPE *error)
+{
+    int i, j;
+    LPC_TYPE err;
+    LPC_TYPE gen0[MAX_LPC_ORDER], gen1[MAX_LPC_ORDER];
+
+    for (i = 0; i < max_order; i++)
+        gen0[i] = gen1[i] = autoc[i + 1];
+
+    err    = autoc[0];
+    ref[0] = -gen1[0] / err;
+    err   +=  gen1[0] * ref[0];
+    if (error)
+        error[0] = err;
+    for (i = 1; i < max_order; i++) {
+        for (j = 0; j < max_order - i; j++) {
+            gen1[j] = gen1[j + 1] + ref[i - 1] * gen0[j];
+            gen0[j] = gen1[j + 1] * ref[i - 1] + gen0[j];
+        }
+        ref[i] = -gen1[0] / err;
+        err   +=  gen1[0] * ref[i];
+        if (error)
+            error[i] = err;
+    }
+}
+
+/**
  * Levinson-Durbin recursion.
  * Produce LPC coefficients from autocorrelation data.
  */
@@ -118,8 +157,10 @@ static inline int compute_lpc_coefs(const LPC_TYPE *autoc, int max_order,
                                     int normalize)
 {
     int i, j;
-    LPC_TYPE err;
+    LPC_TYPE err = 0;
     LPC_TYPE *lpc_last = lpc;
+
+    av_assert2(normalize || !fail);
 
     if (normalize)
         err = *autoc++;

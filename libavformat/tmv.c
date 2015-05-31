@@ -26,8 +26,10 @@
  * @see http://www.oldskool.org/pc/8088_Corruption
  */
 
+#include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "internal.h"
 
 enum {
     TMV_PADDING = 0x01,
@@ -62,7 +64,7 @@ static int tmv_probe(AVProbeData *p)
     return 0;
 }
 
-static int tmv_read_header(AVFormatContext *s, AVFormatParameters *ap)
+static int tmv_read_header(AVFormatContext *s)
 {
     TMVContext *tmv   = s->priv_data;
     AVIOContext *pb = s->pb;
@@ -73,10 +75,10 @@ static int tmv_read_header(AVFormatContext *s, AVFormatParameters *ap)
     if (avio_rl32(pb) != TMV_TAG)
         return -1;
 
-    if (!(vst = av_new_stream(s, 0)))
+    if (!(vst = avformat_new_stream(s, NULL)))
         return AVERROR(ENOMEM);
 
-    if (!(ast = av_new_stream(s, 0)))
+    if (!(ast = avformat_new_stream(s, NULL)))
         return AVERROR(ENOMEM);
 
     ast->codec->sample_rate = avio_rl16(pb);
@@ -110,23 +112,29 @@ static int tmv_read_header(AVFormatContext *s, AVFormatParameters *ap)
     }
 
     ast->codec->codec_type            = AVMEDIA_TYPE_AUDIO;
-    ast->codec->codec_id              = CODEC_ID_PCM_U8;
-    ast->codec->channels              = features & TMV_STEREO ? 2 : 1;
+    ast->codec->codec_id              = AV_CODEC_ID_PCM_U8;
+    if (features & TMV_STEREO) {
+        ast->codec->channels       = 2;
+        ast->codec->channel_layout = AV_CH_LAYOUT_STEREO;
+    } else {
+        ast->codec->channels       = 1;
+        ast->codec->channel_layout = AV_CH_LAYOUT_MONO;
+    }
     ast->codec->bits_per_coded_sample = 8;
     ast->codec->bit_rate              = ast->codec->sample_rate *
                                         ast->codec->bits_per_coded_sample;
-    av_set_pts_info(ast, 32, 1, ast->codec->sample_rate);
+    avpriv_set_pts_info(ast, 32, 1, ast->codec->sample_rate);
 
     fps.num = ast->codec->sample_rate * ast->codec->channels;
     fps.den = tmv->audio_chunk_size;
     av_reduce(&fps.num, &fps.den, fps.num, fps.den, 0xFFFFFFFFLL);
 
     vst->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    vst->codec->codec_id   = CODEC_ID_TMV;
-    vst->codec->pix_fmt    = PIX_FMT_PAL8;
+    vst->codec->codec_id   = AV_CODEC_ID_TMV;
+    vst->codec->pix_fmt    = AV_PIX_FMT_PAL8;
     vst->codec->width      = char_cols * 8;
     vst->codec->height     = char_rows * 8;
-    av_set_pts_info(vst, 32, fps.den, fps.num);
+    avpriv_set_pts_info(vst, 32, fps.den, fps.num);
 
     if (features & TMV_PADDING)
         tmv->padding =
@@ -146,7 +154,7 @@ static int tmv_read_packet(AVFormatContext *s, AVPacket *pkt)
     int ret, pkt_size = tmv->stream_index ?
                         tmv->audio_chunk_size : tmv->video_chunk_size;
 
-    if (url_feof(pb))
+    if (avio_feof(pb))
         return AVERROR_EOF;
 
     ret = av_get_packet(pb, pkt, pkt_size);
@@ -173,7 +181,8 @@ static int tmv_read_seek(AVFormatContext *s, int stream_index,
     pos = timestamp *
           (tmv->audio_chunk_size + tmv->video_chunk_size + tmv->padding);
 
-    avio_seek(s->pb, pos + TMV_HEADER_SIZE, SEEK_SET);
+    if (avio_seek(s->pb, pos + TMV_HEADER_SIZE, SEEK_SET) < 0)
+        return -1;
     tmv->stream_index = 0;
     return 0;
 }
@@ -186,5 +195,5 @@ AVInputFormat ff_tmv_demuxer = {
     .read_header    = tmv_read_header,
     .read_packet    = tmv_read_packet,
     .read_seek      = tmv_read_seek,
-    .flags = AVFMT_GENERIC_INDEX,
+    .flags          = AVFMT_GENERIC_INDEX,
 };

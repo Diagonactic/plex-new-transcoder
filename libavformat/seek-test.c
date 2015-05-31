@@ -28,10 +28,6 @@
 #include "libavutil/mathematics.h"
 #include "libavformat/avformat.h"
 
-#undef exit
-#undef printf
-#undef fprintf
-
 static char buffer[20];
 
 static const char *ret_str(int v)
@@ -49,13 +45,12 @@ static const char *ret_str(int v)
 
 static void ts_str(char buffer[60], int64_t ts, AVRational base)
 {
-    double tsval;
     if (ts == AV_NOPTS_VALUE) {
         strcpy(buffer, " NOPTS   ");
         return;
     }
-    tsval = ts * av_q2d(base);
-    snprintf(buffer, 60, "%9f", tsval);
+    ts= av_rescale_q(ts, base, (AVRational){1, 1000000});
+    snprintf(buffer, 60, "%c%"PRId64".%06"PRId64"", ts<0 ? '-' : ' ', FFABS(ts)/1000000, FFABS(ts)%1000000);
 }
 
 int main(int argc, char **argv)
@@ -63,42 +58,67 @@ int main(int argc, char **argv)
     const char *filename;
     AVFormatContext *ic = NULL;
     int i, ret, stream_id;
+    int j;
     int64_t timestamp;
-    AVFormatParameters params, *ap= &params;
-    memset(ap, 0, sizeof(params));
-    ap->channels=1;
-    ap->sample_rate= 22050;
+    AVDictionary *format_opts = NULL;
+    int64_t seekfirst = AV_NOPTS_VALUE;
+    int firstback=0;
+    int frame_count = 1;
+    int duration = 4;
+
+    for(i=2; i<argc; i+=2){
+        if       (!strcmp(argv[i], "-seekforw")){
+            seekfirst = atoi(argv[i+1]);
+        } else if(!strcmp(argv[i], "-seekback")){
+            seekfirst = atoi(argv[i+1]);
+            firstback = 1;
+        } else if(!strcmp(argv[i], "-frames")){
+            frame_count = atoi(argv[i+1]);
+        } else if(!strcmp(argv[i], "-duration")){
+            duration = atoi(argv[i+1]);
+        } else {
+            argc = 1;
+        }
+    }
+
+    av_dict_set(&format_opts, "channels", "1", 0);
+    av_dict_set(&format_opts, "sample_rate", "22050", 0);
 
     /* initialize libavcodec, and register all codecs and formats */
     av_register_all();
 
-    if (argc != 2) {
+    if (argc < 2) {
         printf("usage: %s input_file\n"
                "\n", argv[0]);
-        exit(1);
+        return 1;
     }
 
     filename = argv[1];
 
-    ret = av_open_input_file(&ic, filename, NULL, 0, ap);
+    ret = avformat_open_input(&ic, filename, NULL, &format_opts);
+    av_dict_free(&format_opts);
     if (ret < 0) {
         fprintf(stderr, "cannot open %s\n", filename);
-        exit(1);
+        return 1;
     }
 
-    ret = av_find_stream_info(ic);
+    ret = avformat_find_stream_info(ic, NULL);
     if (ret < 0) {
         fprintf(stderr, "%s: could not find codec parameters\n", filename);
-        exit(1);
+        return 1;
     }
 
+    if(seekfirst != AV_NOPTS_VALUE){
+        if(firstback)   avformat_seek_file(ic, -1, INT64_MIN, seekfirst, seekfirst, 0);
+        else            avformat_seek_file(ic, -1, seekfirst, seekfirst, INT64_MAX, 0);
+    }
     for(i=0; ; i++){
-        AVPacket pkt;
+        AVPacket pkt = { 0 };
         AVStream *av_uninit(st);
         char ts_buf[60];
 
-        memset(&pkt, 0, sizeof(pkt));
         if(ret>=0){
+            for(j=0; j<frame_count; j++) {
             ret= av_read_frame(ic, &pkt);
             if(ret>=0){
                 char dts_buf[60];
@@ -110,12 +130,13 @@ int main(int argc, char **argv)
             } else
                 printf("ret:%s", ret_str(ret)); // necessary to avoid trailing whitespace
             printf("\n");
+            }
         }
 
         if(i>25) break;
 
         stream_id= (i>>1)%(ic->nb_streams+1) - 1;
-        timestamp= (i*19362894167LL) % (4*AV_TIME_BASE) - AV_TIME_BASE;
+        timestamp= (i*19362894167LL) % (duration*AV_TIME_BASE) - AV_TIME_BASE;
         if(stream_id>=0){
             st= ic->streams[stream_id];
             timestamp= av_rescale_q(timestamp, AV_TIME_BASE_Q, st->time_base);
@@ -127,7 +148,7 @@ int main(int argc, char **argv)
         printf("ret:%-10s st:%2d flags:%d  ts:%s\n", ret_str(ret), stream_id, i&1, ts_buf);
     }
 
-    av_close_input_file(ic);
+    avformat_close_input(&ic);
 
     return 0;
 }

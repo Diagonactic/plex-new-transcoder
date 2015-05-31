@@ -1,4 +1,4 @@
-/**
+/*
  * RTP Depacketization of MP4A-LATM, RFC 3016
  * Copyright (c) 2010 Martin Storsjo
  *
@@ -23,7 +23,6 @@
 #include "internal.h"
 #include "libavutil/avstring.h"
 #include "libavcodec/get_bits.h"
-#include <strings.h>
 
 struct PayloadContext {
     AVIOContext *dyn_buf;
@@ -52,7 +51,8 @@ static void latm_free_context(PayloadContext *data)
 
 static int latm_parse_packet(AVFormatContext *ctx, PayloadContext *data,
                              AVStream *st, AVPacket *pkt, uint32_t *timestamp,
-                             const uint8_t *buf, int len, int flags)
+                             const uint8_t *buf, int len, uint16_t seq,
+                             int flags)
 {
     int ret, cur_len;
 
@@ -130,10 +130,7 @@ static int parse_fmtp_config(AVStream *st, char *value)
         goto end;
     }
     av_freep(&st->codec->extradata);
-    st->codec->extradata_size = (get_bits_left(&gb) + 7)/8;
-    st->codec->extradata = av_mallocz(st->codec->extradata_size +
-                                      FF_INPUT_BUFFER_PADDING_SIZE);
-    if (!st->codec->extradata) {
+    if (ff_alloc_extradata(st->codec, (get_bits_left(&gb) + 7)/8)) {
         ret = AVERROR(ENOMEM);
         goto end;
     }
@@ -145,7 +142,8 @@ end:
     return ret;
 }
 
-static int parse_fmtp(AVStream *stream, PayloadContext *data,
+static int parse_fmtp(AVFormatContext *s,
+                      AVStream *stream, PayloadContext *data,
                       char *attr, char *value)
 {
     int res;
@@ -157,8 +155,8 @@ static int parse_fmtp(AVStream *stream, PayloadContext *data,
     } else if (!strcmp(attr, "cpresent")) {
         int cpresent = atoi(value);
         if (cpresent != 0)
-            av_log_missing_feature(NULL, "RTP MP4A-LATM with in-band "
-                                         "configuration", 1);
+            avpriv_request_sample(s,
+                                  "RTP MP4A-LATM with in-band configuration");
     }
 
     return 0;
@@ -169,8 +167,11 @@ static int latm_parse_sdp_line(AVFormatContext *s, int st_index,
 {
     const char *p;
 
+    if (st_index < 0)
+        return 0;
+
     if (av_strstart(line, "fmtp:", &p))
-        return ff_parse_fmtp(s->streams[st_index], data, p, parse_fmtp);
+        return ff_parse_fmtp(s, s->streams[st_index], data, p, parse_fmtp);
 
     return 0;
 }
@@ -178,7 +179,7 @@ static int latm_parse_sdp_line(AVFormatContext *s, int st_index,
 RTPDynamicProtocolHandler ff_mp4a_latm_dynamic_handler = {
     .enc_name           = "MP4A-LATM",
     .codec_type         = AVMEDIA_TYPE_AUDIO,
-    .codec_id           = CODEC_ID_AAC,
+    .codec_id           = AV_CODEC_ID_AAC,
     .parse_sdp_a_line   = latm_parse_sdp_line,
     .alloc              = latm_new_context,
     .free               = latm_free_context,

@@ -27,7 +27,6 @@
 #include "avc.h"
 #include "internal.h"
 #include "libavutil/avstring.h"
-#include "libavutil/intfloat_readwrite.h"
 #include "libavutil/mathematics.h"
 #include "libavutil/opt.h"
 #include "libavutil/dict.h"
@@ -36,23 +35,25 @@
 #undef NDEBUG
 #include <assert.h>
 
+#define MOV_CLASS(flavor)\
+static const AVClass flavor ## _muxer_class = {\
+    .class_name = #flavor " muxer",\
+    .item_name  = av_default_item_name,\
+    .option     = options,\
+    .version    = LIBAVUTIL_VERSION_INT,\
+};
+
 typedef struct PMSMuxContext
 {
- MOVTrack *tracks;
- int       have_written_header;
- int       timebase;
+  const AVClass *av_class;
+  MOVTrack *tracks;
+  int       have_written_header;
+  int       timebase;
 } PMSMuxContext;
 
 static const AVOption options[] = {
     {"timebase", "set timebase", offsetof(PMSMuxContext, timebase), FF_OPT_TYPE_INT, { 0 }, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
     { NULL },
-};
-
-static const AVClass pms_muxer_class = {
-    .class_name = "Plex Media Server muxer",
-    .item_name  = av_default_item_name,
-    .option     = options,
-    .version    = LIBAVUTIL_VERSION_INT,
 };
 
 static char* hex2str(char* dst, unsigned char const* start, unsigned char const* end)
@@ -102,7 +103,7 @@ static int pms_write_header(AVFormatContext *s)
     // Set the timebase if we have a specific requirement.
     if (mov->timebase != 0)
     {
-      av_set_pts_info(st, 64, 1, mov->timebase);
+      avpriv_set_pts_info(st, 64, 1, mov->timebase);
     }
     else
     {
@@ -111,7 +112,7 @@ static int pms_write_header(AVFormatContext *s)
       else if(st->codec->codec_type == AVMEDIA_TYPE_AUDIO)
         timescale = st->codec->sample_rate;
       
-      av_set_pts_info(st, 64, 1, timescale);
+      avpriv_set_pts_info(st, 64, 1, timescale);
     }
     
     if (st->codec->codec_type == AVMEDIA_TYPE_VIDEO)
@@ -194,17 +195,17 @@ static int pms_write_packet(AVFormatContext *s, AVPacket *pkt)
   }
 
   /* copy extradata if it exists */
-  if (trk->vosLen == 0 && enc->extradata_size > 0) 
+  if (trk->vos_len == 0 && enc->extradata_size > 0) 
   {
-    trk->vosLen = enc->extradata_size;
-    trk->vosData = av_malloc(trk->vosLen);
-    memcpy(trk->vosData, enc->extradata, trk->vosLen);
+    trk->vos_len = enc->extradata_size;
+    trk->vos_data = av_malloc(trk->vos_len);
+    memcpy(trk->vos_data, enc->extradata, trk->vos_len);
   }
   
   avio_printf(pb, "Stream: %d\n", pkt->stream_index);
   avio_printf(pb, "Duration: %d\n", pkt->duration);
 
-  if (enc->codec_id == CODEC_ID_H264 && trk->vosLen > 0 && *(uint8_t *)trk->vosData != 1) 
+  if (enc->codec_id == CODEC_ID_H264 && trk->vos_len > 0 && *(uint8_t *)trk->vos_data != 1) 
   {
     /* from x264 or from bytestream h264 */
     /* nal reformating needed */
@@ -242,17 +243,19 @@ static int pms_write_trailer(AVFormatContext *s)
     return 0;
 }
 
+MOV_CLASS(pms)
 AVOutputFormat ff_pms_muxer = {
     .name              = "pms",
     .long_name         = NULL_IF_CONFIG_SMALL("PMS format"),
     .extensions        = "pms",
     .priv_data_size    = sizeof(PMSMuxContext),
     .audio_codec       = CODEC_ID_AAC,
-    .video_codec       = CODEC_ID_MPEG4,
+    .video_codec       = CONFIG_LIBX264_ENCODER ?
+                         AV_CODEC_ID_H264 : AV_CODEC_ID_MPEG4,
     .write_header      = pms_write_header,
     .write_packet      = pms_write_packet,
     .write_trailer     = pms_write_trailer,
     .flags             = AVFMT_GLOBALHEADER,
-    .codec_tag = (const AVCodecTag* const []){codec_movvideo_tags, codec_movaudio_tags, 0},
+    .codec_tag = (const AVCodecTag* const []){ff_codec_movvideo_tags, ff_codec_movaudio_tags, 0},
     .priv_class = &pms_muxer_class,
 };

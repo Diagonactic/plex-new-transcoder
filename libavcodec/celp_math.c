@@ -22,25 +22,12 @@
 
 #include <inttypes.h>
 #include <limits.h>
-#include <assert.h>
 
+#include "libavutil/avassert.h"
 #include "avcodec.h"
+#include "mathops.h"
 #include "celp_math.h"
-
-/**
- * Cosine table: base_cos[i] = (1<<15) * cos(i*PI/64)
- */
-static const int16_t tab_cos[65] =
-{
-  32767,  32738,  32617,  32421,  32145,  31793,  31364,  30860,
-  30280,  29629,  28905,  28113,  27252,  26326,  25336,  24285,
-  23176,  22011,  20793,  19525,  18210,  16851,  15451,  14014,
-  12543,  11043,   9515,   7965,   6395,   4810,   3214,   1609,
-      1,  -1607,  -3211,  -4808,  -6393,  -7962,  -9513, -11040,
- -12541, -14012, -15449, -16848, -18207, -19523, -20791, -22009,
- -23174, -24283, -25334, -26324, -27250, -28111, -28904, -29627,
- -30279, -30858, -31363, -31792, -32144, -32419, -32616, -32736, -32768,
-};
+#include "libavutil/common.h"
 
 static const uint16_t exp2a[]=
 {
@@ -58,21 +45,11 @@ static const uint16_t exp2b[]=
  17176, 17898, 18620, 19343, 20066, 20790, 21514, 22238,
 };
 
-int16_t ff_cos(uint16_t arg)
-{
-    uint8_t offset= arg;
-    uint8_t ind = arg >> 8;
-
-    assert(arg <= 0x3fff);
-
-    return tab_cos[ind] + (offset * (tab_cos[ind+1] - tab_cos[ind]) >> 8);
-}
-
 int ff_exp2(uint16_t power)
 {
     unsigned int result= exp2a[power>>10] + 0x10000;
 
-    assert(power <= 0x7fff);
+    av_assert2(power <= 0x7fff);
 
     result= (result<<3) + ((result*exp2b[(power>>5)&31])>>17);
     return result + ((result*(power&31)*89)>>22);
@@ -85,13 +62,20 @@ int ff_exp2(uint16_t power)
  */
 static const uint16_t tab_log2[33] =
 {
+#ifdef G729_BITEXACT
+      0,   1455,   2866,   4236,   5568,   6863,   8124,   9352,
+  10549,  11716,  12855,  13967,  15054,  16117,  17156,  18172,
+  19167,  20142,  21097,  22033,  22951,  23852,  24735,  25603,
+  26455,  27291,  28113,  28922,  29716,  30497,  31266,  32023,  32767,
+#else
       4,   1459,   2870,   4240,   5572,   6867,   8127,   9355,
   10552,  11719,  12858,  13971,  15057,  16120,  17158,  18175,
   19170,  20145,  21100,  22036,  22954,  23854,  24738,  25605,
   26457,  27294,  28116,  28924,  29719,  30500,  31269,  32025,  32769,
+#endif
 };
 
-int ff_log2(uint32_t value)
+int ff_log2_q15(uint32_t value)
 {
     uint8_t  power_int;
     uint8_t  frac_x0;
@@ -111,6 +95,17 @@ int ff_log2(uint32_t value)
     return (power_int << 15) + value;
 }
 
+int64_t ff_dot_product(const int16_t *a, const int16_t *b, int length)
+{
+    int i;
+    int64_t sum = 0;
+
+    for (i = 0; i < length; i++)
+        sum += MUL16(a[i], b[i]);
+
+    return sum;
+}
+
 float ff_dot_productf(const float* a, const float* b, int length)
 {
     float sum = 0;
@@ -120,4 +115,12 @@ float ff_dot_productf(const float* a, const float* b, int length)
         sum += a[i] * b[i];
 
     return sum;
+}
+
+void ff_celp_math_init(CELPMContext *c)
+{
+    c->dot_productf   = ff_dot_productf;
+
+    if(HAVE_MIPSFPU)
+        ff_celp_math_init_mips(c);
 }

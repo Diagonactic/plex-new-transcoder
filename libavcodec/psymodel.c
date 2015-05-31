@@ -19,9 +19,12 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <string.h>
+
 #include "avcodec.h"
 #include "psymodel.h"
 #include "iirfilter.h"
+#include "libavutil/mem.h"
 
 extern const FFPsyModel ff_aac_psy_model;
 
@@ -32,10 +35,10 @@ av_cold int ff_psy_init(FFPsyContext *ctx, AVCodecContext *avctx, int num_lens,
     int i, j, k = 0;
 
     ctx->avctx = avctx;
-    ctx->ch        = av_mallocz(sizeof(ctx->ch[0]) * avctx->channels * 2);
-    ctx->group     = av_mallocz(sizeof(ctx->group[0]) * num_groups);
-    ctx->bands     = av_malloc (sizeof(ctx->bands[0])     * num_lens);
-    ctx->num_bands = av_malloc (sizeof(ctx->num_bands[0]) * num_lens);
+    ctx->ch        = av_mallocz_array(sizeof(ctx->ch[0]), avctx->channels * 2);
+    ctx->group     = av_mallocz_array(sizeof(ctx->group[0]), num_groups);
+    ctx->bands     = av_malloc_array (sizeof(ctx->bands[0]),      num_lens);
+    ctx->num_bands = av_malloc_array (sizeof(ctx->num_bands[0]),  num_lens);
     memcpy(ctx->bands,     bands,     sizeof(ctx->bands[0])     *  num_lens);
     memcpy(ctx->num_bands, num_bands, sizeof(ctx->num_bands[0]) *  num_lens);
 
@@ -51,7 +54,7 @@ av_cold int ff_psy_init(FFPsyContext *ctx, AVCodecContext *avctx, int num_lens,
     }
 
     switch (ctx->avctx->codec_id) {
-    case CODEC_ID_AAC:
+    case AV_CODEC_ID_AAC:
         ctx->model = &ff_aac_psy_model;
         break;
     }
@@ -72,7 +75,7 @@ FFPsyChannelGroup *ff_psy_find_group(FFPsyContext *ctx, int channel)
 
 av_cold void ff_psy_end(FFPsyContext *ctx)
 {
-    if (ctx->model->end)
+    if (ctx->model && ctx->model->end)
         ctx->model->end(ctx);
     av_freep(&ctx->bands);
     av_freep(&ctx->num_bands);
@@ -85,6 +88,7 @@ typedef struct FFPsyPreprocessContext{
     float stereo_att;
     struct FFIIRFilterCoeffs *fcoeffs;
     struct FFIIRFilterState **fstate;
+    struct FFIIRFilterContext fiir;
 }FFPsyPreprocessContext;
 
 #define FILT_ORDER 4
@@ -100,43 +104,44 @@ av_cold struct FFPsyPreprocessContext* ff_psy_preprocess_init(AVCodecContext *av
     if (avctx->cutoff > 0)
         cutoff_coeff = 2.0 * avctx->cutoff / avctx->sample_rate;
 
-    if (cutoff_coeff)
+    if (!cutoff_coeff && avctx->codec_id == AV_CODEC_ID_AAC)
+        cutoff_coeff = 2.0 * AAC_CUTOFF(avctx) / avctx->sample_rate;
+
+    if (cutoff_coeff && cutoff_coeff < 0.98)
     ctx->fcoeffs = ff_iir_filter_init_coeffs(avctx, FF_FILTER_TYPE_BUTTERWORTH,
                                              FF_FILTER_MODE_LOWPASS, FILT_ORDER,
                                              cutoff_coeff, 0.0, 0.0);
     if (ctx->fcoeffs) {
-        ctx->fstate = av_mallocz(sizeof(ctx->fstate[0]) * avctx->channels);
+        ctx->fstate = av_mallocz_array(sizeof(ctx->fstate[0]), avctx->channels);
         for (i = 0; i < avctx->channels; i++)
             ctx->fstate[i] = ff_iir_filter_init_state(FILT_ORDER);
     }
+
+    ff_iir_filter_init(&ctx->fiir);
+
     return ctx;
 }
 
-void ff_psy_preprocess(struct FFPsyPreprocessContext *ctx,
-                       const int16_t *audio, int16_t *dest,
-                       int tag, int channels)
+void ff_psy_preprocess(struct FFPsyPreprocessContext *ctx, float **audio, int channels)
 {
-    int ch, i;
+    int ch;
+    int frame_size = ctx->avctx->frame_size;
+    FFIIRFilterContext *iir = &ctx->fiir;
+
     if (ctx->fstate) {
         for (ch = 0; ch < channels; ch++)
-            ff_iir_filter(ctx->fcoeffs, ctx->fstate[tag+ch], ctx->avctx->frame_size,
-                          audio + ch, ctx->avctx->channels,
-                          dest  + ch, ctx->avctx->channels);
-    } else {
-        for (ch = 0; ch < channels; ch++)
-            for (i = 0; i < ctx->avctx->frame_size; i++)
-                dest[i*ctx->avctx->channels + ch] = audio[i*ctx->avctx->channels + ch];
+            iir->filter_flt(ctx->fcoeffs, ctx->fstate[ch], frame_size,
+                            &audio[ch][frame_size], 1, &audio[ch][frame_size], 1);
     }
 }
 
 av_cold void ff_psy_preprocess_end(struct FFPsyPreprocessContext *ctx)
 {
     int i;
-    ff_iir_filter_free_coeffs(ctx->fcoeffs);
+    ff_iir_filter_free_coeffsp(&ctx->fcoeffs);
     if (ctx->fstate)
         for (i = 0; i < ctx->avctx->channels; i++)
-            ff_iir_filter_free_state(ctx->fstate[i]);
+            ff_iir_filter_free_statep(&ctx->fstate[i]);
     av_freep(&ctx->fstate);
     av_free(ctx);
 }
-

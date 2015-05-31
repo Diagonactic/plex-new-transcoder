@@ -1,6 +1,6 @@
 /*
  * id RoQ (.roq) File Demuxer
- * Copyright (c) 2003 The ffmpeg Project
+ * Copyright (c) 2003 The FFmpeg Project
  *
  * This file is part of FFmpeg.
  *
@@ -27,8 +27,11 @@
  *   http://www.csse.monash.edu.au/~timf/
  */
 
+#include "libavutil/channel_layout.h"
 #include "libavutil/intreadwrite.h"
 #include "avformat.h"
+#include "internal.h"
+#include "avio_internal.h"
 
 #define RoQ_MAGIC_NUMBER 0x1084
 #define RoQ_CHUNK_PREAMBLE_SIZE 8
@@ -43,6 +46,7 @@
 
 typedef struct RoqDemuxContext {
 
+    int frame_rate;
     int width;
     int height;
     int audio_channels;
@@ -64,34 +68,25 @@ static int roq_probe(AVProbeData *p)
     return AVPROBE_SCORE_MAX;
 }
 
-static int roq_read_header(AVFormatContext *s,
-                           AVFormatParameters *ap)
+static int roq_read_header(AVFormatContext *s)
 {
     RoqDemuxContext *roq = s->priv_data;
     AVIOContext *pb = s->pb;
-    int framerate;
-    AVStream *st;
     unsigned char preamble[RoQ_CHUNK_PREAMBLE_SIZE];
 
     /* get the main header */
     if (avio_read(pb, preamble, RoQ_CHUNK_PREAMBLE_SIZE) !=
         RoQ_CHUNK_PREAMBLE_SIZE)
         return AVERROR(EIO);
-    framerate = AV_RL16(&preamble[6]);
+    roq->frame_rate = AV_RL16(&preamble[6]);
 
     /* init private context parameters */
     roq->width = roq->height = roq->audio_channels = roq->video_pts =
     roq->audio_frame_count = 0;
     roq->audio_stream_index = -1;
+    roq->video_stream_index = -1;
 
-    st = av_new_stream(s, 0);
-    if (!st)
-        return AVERROR(ENOMEM);
-    av_set_pts_info(st, 63, 1, framerate);
-    roq->video_stream_index = st->index;
-    st->codec->codec_type = AVMEDIA_TYPE_VIDEO;
-    st->codec->codec_id = CODEC_ID_ROQ;
-    st->codec->codec_tag = 0;  /* no fourcc */
+    s->ctx_flags |= AVFMTCTX_NOHEADER;
 
     return 0;
 }
@@ -111,7 +106,7 @@ static int roq_read_packet(AVFormatContext *s,
 
     while (!packet_read) {
 
-        if (url_feof(s->pb))
+        if (avio_feof(s->pb))
             return AVERROR(EIO);
 
         /* get the next chunk preamble */
@@ -124,11 +119,21 @@ static int roq_read_packet(AVFormatContext *s,
         if(chunk_size > INT_MAX)
             return AVERROR_INVALIDDATA;
 
+        chunk_size = ffio_limit(pb, chunk_size);
+
         switch (chunk_type) {
 
         case RoQ_INFO:
-            if (!roq->width || !roq->height) {
-                AVStream *st = s->streams[roq->video_stream_index];
+            if (roq->video_stream_index == -1) {
+                AVStream *st = avformat_new_stream(s, NULL);
+                if (!st)
+                    return AVERROR(ENOMEM);
+                avpriv_set_pts_info(st, 63, 1, roq->frame_rate);
+                roq->video_stream_index = st->index;
+                st->codec->codec_type   = AVMEDIA_TYPE_VIDEO;
+                st->codec->codec_id     = AV_CODEC_ID_ROQ;
+                st->codec->codec_tag    = 0;  /* no fourcc */
+
                 if (avio_read(pb, preamble, RoQ_CHUNK_PREAMBLE_SIZE) != RoQ_CHUNK_PREAMBLE_SIZE)
                     return AVERROR(EIO);
                 st->codec->width  = roq->width  = AV_RL16(preamble);
@@ -140,6 +145,8 @@ static int roq_read_packet(AVFormatContext *s,
             break;
 
         case RoQ_QUAD_CODEBOOK:
+            if (roq->video_stream_index < 0)
+                return AVERROR_INVALIDDATA;
             /* packet needs to contain both this codebook and next VQ chunk */
             codebook_offset = avio_tell(pb) - RoQ_CHUNK_PREAMBLE_SIZE;
             codebook_size = chunk_size;
@@ -166,15 +173,22 @@ static int roq_read_packet(AVFormatContext *s,
         case RoQ_SOUND_MONO:
         case RoQ_SOUND_STEREO:
             if (roq->audio_stream_index == -1) {
-                AVStream *st = av_new_stream(s, 1);
+                AVStream *st = avformat_new_stream(s, NULL);
                 if (!st)
                     return AVERROR(ENOMEM);
-                av_set_pts_info(st, 32, 1, RoQ_AUDIO_SAMPLE_RATE);
+                avpriv_set_pts_info(st, 32, 1, RoQ_AUDIO_SAMPLE_RATE);
                 roq->audio_stream_index = st->index;
                 st->codec->codec_type = AVMEDIA_TYPE_AUDIO;
-                st->codec->codec_id = CODEC_ID_ROQ_DPCM;
+                st->codec->codec_id = AV_CODEC_ID_ROQ_DPCM;
                 st->codec->codec_tag = 0;  /* no tag */
-                st->codec->channels = roq->audio_channels = chunk_type == RoQ_SOUND_STEREO ? 2 : 1;
+                if (chunk_type == RoQ_SOUND_STEREO) {
+                    st->codec->channels       = 2;
+                    st->codec->channel_layout = AV_CH_LAYOUT_STEREO;
+                } else {
+                    st->codec->channels       = 1;
+                    st->codec->channel_layout = AV_CH_LAYOUT_MONO;
+                }
+                roq->audio_channels    = st->codec->channels;
                 st->codec->sample_rate = RoQ_AUDIO_SAMPLE_RATE;
                 st->codec->bits_per_coded_sample = 16;
                 st->codec->bit_rate = st->codec->channels * st->codec->sample_rate *
@@ -182,6 +196,11 @@ static int roq_read_packet(AVFormatContext *s,
                 st->codec->block_align = st->codec->channels * st->codec->bits_per_coded_sample;
             }
         case RoQ_QUAD_VQ:
+            if (chunk_type == RoQ_QUAD_VQ) {
+                if (roq->video_stream_index < 0)
+                    return AVERROR_INVALIDDATA;
+            }
+
             /* load up the packet */
             if (av_new_packet(pkt, chunk_size + RoQ_CHUNK_PREAMBLE_SIZE))
                 return AVERROR(EIO);
@@ -216,8 +235,8 @@ static int roq_read_packet(AVFormatContext *s,
 }
 
 AVInputFormat ff_roq_demuxer = {
-    .name           = "RoQ",
-    .long_name      = NULL_IF_CONFIG_SMALL("id RoQ format"),
+    .name           = "roq",
+    .long_name      = NULL_IF_CONFIG_SMALL("id RoQ"),
     .priv_data_size = sizeof(RoqDemuxContext),
     .read_probe     = roq_probe,
     .read_header    = roq_read_header,

@@ -22,8 +22,9 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "parser.h"
 #include "dca.h"
+#include "get_bits.h"
+#include "parser.h"
 
 typedef struct DCAParseContext {
     ParseContext pc;
@@ -34,15 +35,15 @@ typedef struct DCAParseContext {
 } DCAParseContext;
 
 #define IS_MARKER(state, i, buf, buf_size) \
- ((state == DCA_MARKER_14B_LE && (i < buf_size-2) && (buf[i+1] & 0xF0) == 0xF0 && buf[i+2] == 0x07) \
- || (state == DCA_MARKER_14B_BE && (i < buf_size-2) && buf[i+1] == 0x07 && (buf[i+2] & 0xF0) == 0xF0) \
- || state == DCA_MARKER_RAW_LE || state == DCA_MARKER_RAW_BE)
+    ((state == DCA_MARKER_14B_LE && (i < buf_size - 2) && (buf[i + 1] & 0xF0) == 0xF0 &&  buf[i + 2]         == 0x07) || \
+     (state == DCA_MARKER_14B_BE && (i < buf_size - 2) &&  buf[i + 1]         == 0x07 && (buf[i + 2] & 0xF0) == 0xF0) || \
+      state == DCA_MARKER_RAW_LE || state == DCA_MARKER_RAW_BE || state == DCA_HD_MARKER)
 
 /**
- * finds the end of the current frame in the bitstream.
+ * Find the end of the current frame in the bitstream.
  * @return the position of the first byte of the next frame, or -1
  */
-static int dca_find_frame_end(DCAParseContext * pc1, const uint8_t * buf,
+static int dca_find_frame_end(DCAParseContext *pc1, const uint8_t *buf,
                               int buf_size)
 {
     int start_found, i;
@@ -50,19 +51,17 @@ static int dca_find_frame_end(DCAParseContext * pc1, const uint8_t * buf,
     ParseContext *pc = &pc1->pc;
 
     start_found = pc->frame_start_found;
-    state = pc->state;
+    state       = pc->state;
 
     i = 0;
     if (!start_found) {
         for (i = 0; i < buf_size; i++) {
             state = (state << 8) | buf[i];
             if (IS_MARKER(state, i, buf, buf_size)) {
-                if (pc1->lastmarker && state == pc1->lastmarker) {
-                    start_found = 1;
-                    break;
-                } else if (!pc1->lastmarker) {
-                    start_found = 1;
+                if (!pc1->lastmarker || state == pc1->lastmarker || pc1->lastmarker == DCA_HD_MARKER) {
+                    start_found     = 1;
                     pc1->lastmarker = state;
+                    i++;
                     break;
                 }
             }
@@ -74,25 +73,22 @@ static int dca_find_frame_end(DCAParseContext * pc1, const uint8_t * buf,
             state = (state << 8) | buf[i];
             if (state == DCA_HD_MARKER && !pc1->hd_pos)
                 pc1->hd_pos = pc1->size;
-            if (state == pc1->lastmarker && IS_MARKER(state, i, buf, buf_size)) {
-                if(pc1->framesize > pc1->size)
+            if (IS_MARKER(state, i, buf, buf_size) && (state == pc1->lastmarker || pc1->lastmarker == DCA_HD_MARKER)) {
+                if (pc1->framesize > pc1->size)
                     continue;
-                if(!pc1->framesize){
-                    pc1->framesize = pc1->hd_pos ? pc1->hd_pos : pc1->size;
-                }
                 pc->frame_start_found = 0;
-                pc->state = -1;
-                pc1->size = 0;
+                pc->state             = -1;
+                pc1->size             = 0;
                 return i - 3;
             }
         }
     }
     pc->frame_start_found = start_found;
-    pc->state = state;
+    pc->state             = state;
     return END_NOT_FOUND;
 }
 
-static av_cold int dca_parse_init(AVCodecParserContext * s)
+static av_cold int dca_parse_init(AVCodecParserContext *s)
 {
     DCAParseContext *pc1 = s->priv_data;
 
@@ -100,14 +96,47 @@ static av_cold int dca_parse_init(AVCodecParserContext * s)
     return 0;
 }
 
-static int dca_parse(AVCodecParserContext * s,
-                     AVCodecContext * avctx,
-                     const uint8_t ** poutbuf, int *poutbuf_size,
-                     const uint8_t * buf, int buf_size)
+static int dca_parse_params(const uint8_t *buf, int buf_size, int *duration,
+                            int *sample_rate, int *framesize)
+{
+    GetBitContext gb;
+    uint8_t hdr[12 + FF_INPUT_BUFFER_PADDING_SIZE] = { 0 };
+    int ret, sample_blocks, sr_code;
+
+    if (buf_size < 12)
+        return AVERROR_INVALIDDATA;
+
+    if ((ret = avpriv_dca_convert_bitstream(buf, 12, hdr, 12)) < 0)
+        return ret;
+
+    init_get_bits(&gb, hdr, 96);
+
+    skip_bits_long(&gb, 39);
+    sample_blocks = get_bits(&gb, 7) + 1;
+    if (sample_blocks < 8)
+        return AVERROR_INVALIDDATA;
+    *duration = 256 * (sample_blocks / 8);
+
+    *framesize = get_bits(&gb, 14) + 1;
+    if (*framesize < 95)
+        return AVERROR_INVALIDDATA;
+
+    skip_bits(&gb, 6);
+    sr_code      = get_bits(&gb, 4);
+    *sample_rate = avpriv_dca_sample_rates[sr_code];
+    if (*sample_rate == 0)
+        return AVERROR_INVALIDDATA;
+
+    return 0;
+}
+
+static int dca_parse(AVCodecParserContext *s, AVCodecContext *avctx,
+                     const uint8_t **poutbuf, int *poutbuf_size,
+                     const uint8_t *buf, int buf_size)
 {
     DCAParseContext *pc1 = s->priv_data;
     ParseContext *pc = &pc1->pc;
-    int next;
+    int next, duration, sample_rate;
 
     if (s->flags & PARSER_FLAG_COMPLETE_FRAMES) {
         next = buf_size;
@@ -115,20 +144,28 @@ static int dca_parse(AVCodecParserContext * s,
         next = dca_find_frame_end(pc1, buf, buf_size);
 
         if (ff_combine_frame(pc, next, &buf, &buf_size) < 0) {
-            *poutbuf = NULL;
+            *poutbuf      = NULL;
             *poutbuf_size = 0;
             return buf_size;
         }
     }
-    *poutbuf = buf;
+
+    /* read the duration and sample rate from the frame header */
+    if (!dca_parse_params(buf, buf_size, &duration, &sample_rate, &pc1->framesize)) {
+        s->duration        = duration;
+        avctx->sample_rate = sample_rate;
+    } else
+        s->duration = 0;
+
+    *poutbuf      = buf;
     *poutbuf_size = buf_size;
     return next;
 }
 
 AVCodecParser ff_dca_parser = {
-    {CODEC_ID_DTS},
-    sizeof(DCAParseContext),
-    dca_parse_init,
-    dca_parse,
-    ff_parse_close,
+    .codec_ids      = { AV_CODEC_ID_DTS },
+    .priv_data_size = sizeof(DCAParseContext),
+    .parser_init    = dca_parse_init,
+    .parser_parse   = dca_parse,
+    .parser_close   = ff_parse_close,
 };

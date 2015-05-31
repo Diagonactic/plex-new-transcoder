@@ -3,8 +3,10 @@ include $(SUBDIR)../config.mak
 NAME = postproc
 FFLIBS = avutil
 
-HEADERS = postprocess.h
+HEADERS = postprocess.h        \
+          version.h            \
 
 OBJS = postprocess.o
 
-include $(SRC_PATH)/subdir.mak
+# Windows resource file
+SLIBOBJS-$(HAVE_GNU_WINDRES) += postprocres.o

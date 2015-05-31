@@ -24,31 +24,7 @@
 
 #include "url.h"
 
-/**
- * Set custom HTTP headers.
- * A trailing CRLF ("\r\n") is required for custom headers.
- * Passing in an empty header string ("\0") will reset to defaults.
- *
- * The following headers can be overriden by custom values,
- * otherwise they will be set to their defaults.
- *  -User-Agent
- *  -Accept
- *  -Range
- *  -Host
- *  -Connection
- *
- * @param h URL context for this HTTP connection
- * @param headers the custom headers to set
- */
-void ff_http_set_headers(URLContext *h, const char *headers);
-
-/**
- * Enable or disable chunked transfer encoding. (default is enabled)
- *
- * @param h URL context for this HTTP connection
- * @param is_chunked 0 to disable chunking, nonzero otherwise.
- */
-void ff_http_set_chunked_transfer_encoding(URLContext *h, int is_chunked);
+#define HTTP_HEADERS_SIZE 4096
 
 /**
  * Initialize the authentication state based on another HTTP URLContext.
@@ -61,6 +37,16 @@ void ff_http_set_chunked_transfer_encoding(URLContext *h, int is_chunked);
  */
 void ff_http_init_auth_state(URLContext *dest, const URLContext *src);
 
-char* PMS_IssueHttpRequest(const char* url, const char* verb, int timeout, int* httpCode);
+/**
+ * Send a new HTTP request, reusing the old connection.
+ *
+ * @param h pointer to the resource
+ * @param uri uri used to perform the request
+ * @return a negative value if an error condition occurred, 0
+ * otherwise
+ */
+int ff_http_do_new_request(URLContext *h, const char *uri);
+
+int ff_http_averror(int status_code, int default_averror);
 
 #endif /* AVFORMAT_HTTP_H */

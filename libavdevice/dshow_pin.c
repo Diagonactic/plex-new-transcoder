@@ -19,7 +19,7 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "dshow.h"
+#include "dshow_capture.h"
 
 #include <stddef.h>
 #define imemoffset offsetof(libAVPin, imemvtbl)
@@ -73,6 +73,7 @@ libAVPin_Disconnect(libAVPin *this)
         return VFW_E_NOT_STOPPED;
     if (!this->connectedto)
         return S_FALSE;
+    IPin_Release(this->connectedto);
     this->connectedto = NULL;
 
     return S_OK;
@@ -284,7 +285,7 @@ libAVMemInputPin_GetAllocator(libAVMemInputPin *this, IMemAllocator **alloc)
 }
 long WINAPI
 libAVMemInputPin_NotifyAllocator(libAVMemInputPin *this, IMemAllocator *alloc,
-                                 WINBOOL rdwr)
+                                 BOOL rdwr)
 {
     dshowdebug("libAVMemInputPin_NotifyAllocator(%p)\n", this);
     return S_OK;
@@ -327,7 +328,7 @@ libAVMemInputPin_Receive(libAVMemInputPin *this, IMediaSample *sample)
     priv_data = pin->filter->priv_data;
     index = pin->filter->stream_index;
 
-    pin->filter->callback(priv_data, index, buf, buf_size, curtime);
+    pin->filter->callback(priv_data, index, buf, buf_size, curtime, devtype);
 
     return S_OK;
 }
@@ -357,5 +358,5 @@ libAVMemInputPin_Destroy(libAVMemInputPin *this)
 {
     libAVPin *pin = (libAVPin *) ((uint8_t *) this - imemoffset);
     dshowdebug("libAVMemInputPin_Destroy(%p)\n", this);
-    return libAVPin_Destroy(pin);
+    libAVPin_Destroy(pin);
 }

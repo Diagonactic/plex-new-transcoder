@@ -46,31 +46,22 @@
  */
 
 #include <alsa/asoundlib.h>
+#include "libavformat/internal.h"
 #include "libavutil/opt.h"
 #include "libavutil/mathematics.h"
+#include "libavutil/time.h"
 
 #include "avdevice.h"
 #include "alsa-audio.h"
 
-static av_cold int audio_read_header(AVFormatContext *s1,
-                                     AVFormatParameters *ap)
+static av_cold int audio_read_header(AVFormatContext *s1)
 {
     AlsaData *s = s1->priv_data;
     AVStream *st;
     int ret;
-    enum CodecID codec_id;
-    snd_pcm_sw_params_t *sw_params;
-    double o;
+    enum AVCodecID codec_id;
 
-#if FF_API_FORMAT_PARAMETERS
-    if (ap->sample_rate > 0)
-        s->sample_rate = ap->sample_rate;
-
-    if (ap->channels > 0)
-        s->channels = ap->channels;
-#endif
-
-    st = av_new_stream(s1, 0);
+    st = avformat_new_stream(s1, NULL);
     if (!st) {
         av_log(s1, AV_LOG_ERROR, "Cannot add stream\n");
 
@@ -89,10 +80,10 @@ static av_cold int audio_read_header(AVFormatContext *s1,
     st->codec->codec_id    = codec_id;
     st->codec->sample_rate = s->sample_rate;
     st->codec->channels    = s->channels;
-    av_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
-    o = 2 * M_PI * s->period_size / s->sample_rate * 1.5; // bandwidth: 1.5Hz
+    avpriv_set_pts_info(st, 64, 1, 1000000);  /* 64 bits pts in us */
+    /* microseconds instead of seconds, MHz instead of Hz */
     s->timefilter = ff_timefilter_new(1000000.0 / s->sample_rate,
-                                      sqrt(2 * o), o * o);
+                                      s->period_size, 1.5E-6);
     if (!s->timefilter)
         goto fail;
 
@@ -106,7 +97,6 @@ fail:
 static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
 {
     AlsaData *s  = s1->priv_data;
-    AVStream *st = s1->streams[0];
     int res;
     int64_t dts;
     snd_pcm_sframes_t delay = 0;
@@ -134,16 +124,22 @@ static int audio_read_packet(AVFormatContext *s1, AVPacket *pkt)
     dts = av_gettime();
     snd_pcm_delay(s->h, &delay);
     dts -= av_rescale(delay + res, 1000000, s->sample_rate);
-    pkt->pts = ff_timefilter_update(s->timefilter, dts, res);
+    pkt->pts = ff_timefilter_update(s->timefilter, dts, s->last_period);
+    s->last_period = res;
 
     pkt->size = res * s->frame_size;
 
     return 0;
 }
 
+static int audio_get_device_list(AVFormatContext *h, AVDeviceInfoList *device_list)
+{
+    return ff_alsa_get_device_list(device_list, SND_PCM_STREAM_CAPTURE);
+}
+
 static const AVOption options[] = {
-    { "sample_rate", "", offsetof(AlsaData, sample_rate), FF_OPT_TYPE_INT, {.dbl = 48000}, 1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
-    { "channels",    "", offsetof(AlsaData, channels),    FF_OPT_TYPE_INT, {.dbl = 2},     1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
+    { "sample_rate", "", offsetof(AlsaData, sample_rate), AV_OPT_TYPE_INT, {.i64 = 48000}, 1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
+    { "channels",    "", offsetof(AlsaData, channels),    AV_OPT_TYPE_INT, {.i64 = 2},     1, INT_MAX, AV_OPT_FLAG_DECODING_PARAM },
     { NULL },
 };
 
@@ -152,16 +148,17 @@ static const AVClass alsa_demuxer_class = {
     .item_name      = av_default_item_name,
     .option         = options,
     .version        = LIBAVUTIL_VERSION_INT,
+    .category       = AV_CLASS_CATEGORY_DEVICE_AUDIO_INPUT,
 };
 
 AVInputFormat ff_alsa_demuxer = {
-    "alsa",
-    NULL_IF_CONFIG_SMALL("ALSA audio input"),
-    sizeof(AlsaData),
-    NULL,
-    audio_read_header,
-    audio_read_packet,
-    ff_alsa_close,
-    .flags = AVFMT_NOFILE,
-    .priv_class = &alsa_demuxer_class,
+    .name           = "alsa",
+    .long_name      = NULL_IF_CONFIG_SMALL("ALSA audio input"),
+    .priv_data_size = sizeof(AlsaData),
+    .read_header    = audio_read_header,
+    .read_packet    = audio_read_packet,
+    .read_close     = ff_alsa_close,
+    .get_device_list = audio_get_device_list,
+    .flags          = AVFMT_NOFILE,
+    .priv_class     = &alsa_demuxer_class,
 };
