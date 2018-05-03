@@ -53,9 +53,9 @@ make_dir() {
 typeset -g api_version=''
 typeset -g pms_url=''
 query_pms_update_service() {
-	() {
-	    echo "Querying PMS update service at $1"
-	    [[ -n "$1" ]] || die "Update request is invalid"
+    () {
+        echo "Querying PMS update service at $1"
+	[[ -n "$1" ]] || die "Update request is invalid"
         api_version="`cat "$1" | jq --raw-output '.computer.FreeBSD.version'`"
         [[ -n "$api_version" ]] || die "Failed to get API version from update service"
         pms_url="`cat "$1" | jq --raw-output '.computer.FreeBSD.releases[].url'`"
@@ -65,11 +65,11 @@ query_pms_update_service() {
 
 pms_requires_update() {
     query_pms_update_service
-    if [[ ! -f "${SCRIPT_PATH}/last.version" ]]; then 
+    if [[ ! -f "${SCRIPT_PATH}/latest.version" ]]; then 
         echo "Last downloaded version is not known; PMS requires updating"
         return 0; 
     fi
-    local last_version="$(cat "${SCRIPT_PATH}/last.version")"
+    local last_version="$(cat "${SCRIPT_PATH}/latest.version")"
     echo "API Reports version $api_version; Last version downloaded was $last_version"
     if [[ "$last_version" == "$api_version" ]]; then 
         echo "Last version, $last_version, matched API version."
