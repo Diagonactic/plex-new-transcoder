@@ -107,7 +107,6 @@ get_ffmpeg_archives_from_server() {
         echo "Downloading $url to '$temp_path'"
         () {
             local archive_file="$1"
-            cp "$1" "$compare_file.downloaded"
             echo "Download completed to $1"
             [[ -n "$1" ]] || {
                 echo "Failed to download ffmpeg archive from $url"
@@ -181,8 +180,8 @@ if pms_requires_update; then
     fi
     commit_msg+="Synchronized with version $api_version on `date -u --rfc-3339=seconds`"
     cd "${SCRIPT_PATH}"
-    #git add .
-    #git commit -m "$commit_msg"
-    #git push
+    git add .
+    git commit -m "$commit_msg"
+    git push
 fi
 rm -rf ${WORK_PATH} > /dev/null 2>&1
