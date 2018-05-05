@@ -132,10 +132,10 @@ static int add_file(AVFormatContext *avf, char *filename, ConcatFile **rfile,
         url = filename;
         filename = NULL;
     } else {
-        url_len = strlen(avf->filename) + strlen(filename) + 16;
+        url_len = strlen(avf->url) + strlen(filename) + 16;
         if (!(url = av_malloc(url_len)))
             FAIL(AVERROR(ENOMEM));
-        ff_make_absolute_url(url, url_len, avf->filename, filename);
+        ff_make_absolute_url(url, url_len, avf->url, filename);
         av_freep(&filename);
     }
 
@@ -191,8 +191,8 @@ static int copy_stream_props(AVStream *st, AVStream *source_st)
         return ret;
     st->r_frame_rate        = source_st->r_frame_rate;
     st->avg_frame_rate      = source_st->avg_frame_rate;
-    st->time_base           = source_st->time_base;
     st->sample_aspect_ratio = source_st->sample_aspect_ratio;
+    avpriv_set_pts_info(st, 64, source_st->time_base.num, source_st->time_base.den);
 
     av_dict_copy(&st->metadata, source_st->metadata, 0);
     return 0;
@@ -423,7 +423,6 @@ static int concat_read_header(AVFormatContext *avf)
         } else if (!strcmp(keyword, "duration") || !strcmp(keyword, "inpoint") || !strcmp(keyword, "outpoint")) {
             char *dur_str = get_keyword(&cursor);
             int64_t dur;
-            int64_t delta = 0;
             if (!file) {
                 av_log(avf, AV_LOG_ERROR, "Line %d: %s without file\n",
                        line, keyword);
@@ -637,7 +636,7 @@ static int concat_read_packet(AVFormatContext *avf, AVPacket *pkt)
             av_packet_unref(pkt);
             continue;
         }
-        if (!cat->cur_file->got_first) {
+        if ((cat->skip_before_inpoint || cat->skip_before_video_key) && !cat->cur_file->got_first) {
             cat->cur_file->file_inpoint = av_rescale_q(pkt->pts, cat->avf->streams[pkt->stream_index]->time_base, AV_TIME_BASE_Q);
             cat->cur_file->got_first = 1;
         }

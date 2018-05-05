@@ -54,7 +54,7 @@ typedef struct MadContext {
     GetBitContext gb;
     void *bitstream_buf;
     unsigned int bitstream_buf_size;
-    DECLARE_ALIGNED(16, int16_t, block)[64];
+    DECLARE_ALIGNED(32, int16_t, block)[64];
     ScanTable scantable;
     uint16_t quant_matrix[64];
     int mb_x;
@@ -284,7 +284,7 @@ static int decode_frame(AVCodecContext *avctx,
 
     if (avctx->width != width || avctx->height != height) {
         av_frame_unref(s->last_frame);
-        if((width * height)/2048*7 > bytestream2_get_bytes_left(&gb))
+        if((width * (int64_t)height)/2048*7 > bytestream2_get_bytes_left(&gb))
             return AVERROR_INVALIDDATA;
         if ((ret = ff_set_dimensions(avctx, width, height)) < 0)
             return ret;

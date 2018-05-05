@@ -814,7 +814,7 @@ static int mpegts_set_stream_info(AVStream *st, PESContext *pes,
     st->codecpar->codec_tag = pes->stream_type;
 
     mpegts_find_stream_type(st, pes->stream_type, ISO_types);
-    if (pes->stream_type == 4)
+    if (pes->stream_type == 4 || pes->stream_type == 0x0f)
         st->request_probe = 50;
     if ((prog_reg_desc == AV_RL32("HDMV") ||
          prog_reg_desc == AV_RL32("HDPR")) &&
@@ -1840,7 +1840,9 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
         }
         if (i && language[0]) {
             language[i - 1] = 0;
-            av_dict_set(&st->metadata, "language", language, 0);
+            /* don't overwrite language, as it may already have been set by
+             * another, more specific descriptor (e.g. supplementary audio) */
+            av_dict_set(&st->metadata, "language", language, AV_DICT_DONT_OVERWRITE);
         }
         break;
     case 0x05: /* registration descriptor */
@@ -1893,6 +1895,42 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
                 }
                 st->need_parsing = AVSTREAM_PARSE_FULL;
                 st->internal->need_context_update = 1;
+            }
+        }
+        if (ext_desc_tag == 0x06) { /* supplementary audio descriptor */
+            int flags;
+
+            if (desc_len < 1)
+                return AVERROR_INVALIDDATA;
+            flags = get8(pp, desc_end);
+
+            if ((flags & 0x80) == 0) /* mix_type */
+                st->disposition |= AV_DISPOSITION_DEPENDENT;
+
+            switch ((flags >> 2) & 0x1F) { /* editorial_classification */
+            case 0x01:
+                st->disposition |= AV_DISPOSITION_VISUAL_IMPAIRED;
+                break;
+            case 0x02:
+                st->disposition |= AV_DISPOSITION_HEARING_IMPAIRED;
+                break;
+            case 0x03:
+                st->disposition |= AV_DISPOSITION_VISUAL_IMPAIRED;
+                break;
+            }
+
+            if (flags & 0x01) { /* language_code_present */
+                if (desc_len < 4)
+                    return AVERROR_INVALIDDATA;
+                language[0] = get8(pp, desc_end);
+                language[1] = get8(pp, desc_end);
+                language[2] = get8(pp, desc_end);
+                language[3] = 0;
+
+                /* This language always has to override a possible
+                 * ISO 639 language descriptor language */
+                if (language[0])
+                    av_dict_set(&st->metadata, "language", language, 0);
             }
         }
         break;
@@ -2623,6 +2661,8 @@ static int mpegts_read_header(AVFormatContext *s)
     uint8_t buf[8 * 1024] = {0};
     int len;
     int64_t pos, probesize = s->probesize;
+
+    s->internal->prefer_codec_framerate = 1;
 
     if (ffio_ensure_seekback(pb, probesize) < 0)
         av_log(s, AV_LOG_WARNING, "Failed to allocate buffers for seekback\n");

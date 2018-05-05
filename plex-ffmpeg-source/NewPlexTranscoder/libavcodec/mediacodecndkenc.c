@@ -157,12 +157,12 @@ static av_cold int mediacodecndk_encode_init(AVCodecContext *avctx)
         av_log(avctx, AV_LOG_DEBUG, "Got codec specific data of size %d\n", bufferInfo.size);
         if ((ret = av_reallocp(&avctx->extradata,
                                avctx->extradata_size + bufferInfo.size +
-                               FF_INPUT_BUFFER_PADDING_SIZE)) < 0) {
+                               AV_INPUT_BUFFER_PADDING_SIZE)) < 0) {
             goto fail;
         }
         memcpy(avctx->extradata + avctx->extradata_size, outBuffer, bufferInfo.size);
         avctx->extradata_size += bufferInfo.size;
-        memset(avctx->extradata + avctx->extradata_size, 0, FF_INPUT_BUFFER_PADDING_SIZE);
+        memset(avctx->extradata + avctx->extradata_size, 0, AV_INPUT_BUFFER_PADDING_SIZE);
         AMediaCodec_releaseOutputBuffer(ctx->encoder, encoderStatus, false);
     }
 
@@ -382,7 +382,7 @@ AVCodec ff_h264_mediacodecndk_encoder = {
     .send_frame     = mediacodecndk_send_frame,
     .receive_packet = mediacodecndk_receive_packet,
     .close = mediacodecndk_encode_close,
-    .capabilities = CODEC_CAP_DELAY,
+    .capabilities = AV_CODEC_CAP_DELAY,
     .priv_class = &mediacodecndk_class,
     .pix_fmts = (const enum AVPixelFormat[]){
         AV_PIX_FMT_NV12,

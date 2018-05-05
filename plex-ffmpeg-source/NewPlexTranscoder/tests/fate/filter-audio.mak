@@ -84,10 +84,15 @@ fate-filter-anequalizer: tests/data/filtergraphs/anequalizer
 fate-filter-anequalizer: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
 fate-filter-anequalizer: CMD = framecrc -i $(SRC) -filter_complex_script $(TARGET_PATH)/tests/data/filtergraphs/anequalizer
 
-FATE_AFILTER-$(call FILTERDEMDECENCMUX, ASETNSAMPLES, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-asetnsamples
-fate-filter-asetnsamples: tests/data/asynth-44100-2.wav
-fate-filter-asetnsamples: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
-fate-filter-asetnsamples: CMD = framecrc -i $(SRC) -af asetnsamples=512:p=1
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, ASETNSAMPLES, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-asetnsamples-pad
+fate-filter-asetnsamples-pad: tests/data/asynth-44100-2.wav
+fate-filter-asetnsamples-pad: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
+fate-filter-asetnsamples-pad: CMD = framecrc -i $(SRC) -af asetnsamples=512:p=1
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, ASETNSAMPLES, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-asetnsamples-nopad
+fate-filter-asetnsamples-nopad: tests/data/asynth-44100-2.wav
+fate-filter-asetnsamples-nopad: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
+fate-filter-asetnsamples-nopad: CMD = framecrc -i $(SRC) -af asetnsamples=512:p=0
 
 FATE_AFILTER-$(call FILTERDEMDECENCMUX, ASETRATE, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-asetrate
 fate-filter-asetrate: tests/data/asynth-44100-2.wav
@@ -118,10 +123,40 @@ FATE_AFILTER-$(call FILTERDEMDECENCMUX, FIREQUALIZER ATRIM VOLUME, WAV, PCM_S16L
 fate-filter-firequalizer: tests/data/asynth-44100-2.wav
 fate-filter-firequalizer: tests/data/filtergraphs/firequalizer
 fate-filter-firequalizer: REF = tests/data/asynth-44100-2.wav
-fate-filter-firequalizer: CMD = ffmpeg -i $(TARGET_PATH)/tests/data/asynth-44100-2.wav -filter_script $(TARGET_PATH)/tests/data/filtergraphs/firequalizer -f wav -acodec pcm_s16le -
+fate-filter-firequalizer: CMD = ffmpeg -i $(TARGET_PATH)/tests/data/asynth-44100-2.wav -filter_script $(TARGET_PATH)/tests/data/filtergraphs/firequalizer -f wav -c:a pcm_s16le -
 fate-filter-firequalizer: CMP = oneoff
 fate-filter-firequalizer: CMP_UNIT = s16
 fate-filter-firequalizer: SIZE_TOLERANCE = 1058400 - 1097208
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, PAN, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-pan-mono1
+fate-filter-pan-mono1: tests/data/asynth-44100-2.wav
+fate-filter-pan-mono1: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
+fate-filter-pan-mono1: CMD = framecrc -ss 3.14 -i $(SRC) -frames:a 20 -filter:a "pan=mono|FC=FL"
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, PAN, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-pan-mono2
+fate-filter-pan-mono2: tests/data/asynth-44100-2.wav
+fate-filter-pan-mono2: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
+fate-filter-pan-mono2: CMD = framecrc -ss 3.14 -i $(SRC) -frames:a 20 -filter:a "pan=1C|c0=c0+c1"
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, PAN, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-pan-stereo1
+fate-filter-pan-stereo1: tests/data/asynth-44100-3.wav
+fate-filter-pan-stereo1: SRC = $(TARGET_PATH)/tests/data/asynth-44100-3.wav
+fate-filter-pan-stereo1: CMD = framecrc -ss 3.14 -i $(SRC) -frames:a 20 -filter:a "pan=2c|FL=FR|FR=FL"
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, PAN, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-pan-stereo2
+fate-filter-pan-stereo2: tests/data/asynth-44100-3.wav
+fate-filter-pan-stereo2: SRC = $(TARGET_PATH)/tests/data/asynth-44100-3.wav
+fate-filter-pan-stereo2: CMD = framecrc -ss 3.14 -i $(SRC) -frames:a 20 -filter:a "pan=stereo|c0=c0-c2|c1=c1-c2"
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, PAN, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-pan-stereo3
+fate-filter-pan-stereo3: tests/data/asynth-44100-2.wav
+fate-filter-pan-stereo3: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
+fate-filter-pan-stereo3: CMD = framecrc -ss 3.14 -i $(SRC) -frames:a 20 -filter:a "pan=FL+FR|FL<3*c0+2*c1|FR<2*c0+3*c1"
+
+FATE_AFILTER-$(call FILTERDEMDECENCMUX, PAN, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-pan-stereo4
+fate-filter-pan-stereo4: tests/data/asynth-44100-2.wav
+fate-filter-pan-stereo4: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.wav
+fate-filter-pan-stereo4: CMD = framecrc -ss 3.14 -guess_layout_max 0 -i $(SRC) -frames:a 20 -filter:a "pan=4C|c0=c0-0.5*c1|c1=c1+0.5*c0|c2=0*c0|c3=0*c0"
 
 FATE_AFILTER_SAMPLES-$(call FILTERDEMDECENCMUX, SILENCEREMOVE, WAV, PCM_S16LE, PCM_S16LE, WAV) += fate-filter-silenceremove
 fate-filter-silenceremove: SRC = $(TARGET_SAMPLES)/audio-reference/divertimenti_2ch_96kHz_s24.wav
@@ -145,8 +180,8 @@ fate-filter-compand: CMD = framecrc -i $(SRC) -frames:a 20 -filter_complex_scrip
 tests/data/hls-list.m3u8: TAG = GEN
 tests/data/hls-list.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< \
-        -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t)::d=20" -f segment -segment_time 10 -map 0 -flags +bitexact -codec:a mp2fixed \
-        -segment_list $(TARGET_PATH)/$@ -y $(TARGET_PATH)/tests/data/hls-out-%03d.ts 2>/dev/null
+        -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t):d=20" -f segment -segment_time 10 -map 0 -flags +bitexact -codec:a mp2fixed \
+        -segment_list $(TARGET_PATH)/$@ -y $(TARGET_PATH)/tests/data/hls-out-%03d.ts -nostdin 2>/dev/null
 
 FATE_AFILTER-$(call ALLYES, HLS_DEMUXER MPEGTS_MUXER MPEGTS_DEMUXER AEVALSRC_FILTER LAVFI_INDEV MP2FIXED_ENCODER) += fate-filter-hls
 fate-filter-hls: tests/data/hls-list.m3u8
@@ -155,12 +190,12 @@ fate-filter-hls: CMD = framecrc -flags +bitexact -i $(TARGET_PATH)/tests/data/hl
 tests/data/hls-list-append.m3u8: TAG = GEN
 tests/data/hls-list-append.m3u8: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< \
-        -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t)::d=20" -f segment -segment_time 10 -map 0 -flags +bitexact -codec:a mp2fixed \
+        -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t):d=20" -f segment -segment_time 10 -map 0 -flags +bitexact -codec:a mp2fixed \
         -segment_list $(TARGET_PATH)/$@ -y $(TARGET_PATH)/tests/data/hls-append-out-%03d.ts 2>/dev/null; \
         $(TARGET_EXEC) $(TARGET_PATH)/$< \
-        -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t)::d=20" -f hls -hls_time 10 -map 0 -flags +bitexact \
+        -f lavfi -i "aevalsrc=cos(2*PI*t)*sin(2*PI*(440+4*t)*t):d=20" -f hls -hls_time 10 -map 0 -flags +bitexact \
         -hls_flags append_list -codec:a mp2fixed -hls_segment_filename $(TARGET_PATH)/tests/data/hls-append-out-%03d.ts \
-        $(TARGET_PATH)/tests/data/hls-list-append.m3u8 2>/dev/null
+        $(TARGET_PATH)/tests/data/hls-list-append.m3u8 -nostdin 2>/dev/null
 
 FATE_AFILTER-$(call ALLYES, HLS_DEMUXER MPEGTS_MUXER MPEGTS_DEMUXER AEVALSRC_FILTER LAVFI_INDEV MP2FIXED_ENCODER) += fate-filter-hls-append
 fate-filter-hls-append: tests/data/hls-list-append.m3u8
@@ -215,7 +250,7 @@ fate-filter-channelmap-one-int: SRC = $(TARGET_PATH)/tests/data/asynth-44100-6.w
 fate-filter-channelmap-one-int: tests/data/asynth-44100-6.wav
 fate-filter-channelmap-one-int: CMD = md5 -i $(SRC) -filter_complex_script $(TARGET_PATH)/tests/data/filtergraphs/channelmap_one_int -f wav -fflags +bitexact
 fate-filter-channelmap-one-int: CMP = oneline
-fate-filter-channelmap-one-int: REF = 428b8f9fac6d57147069b97335019ef5
+fate-filter-channelmap-one-int: REF = 8cfe553d65ed4696756d8c1b824fcdd3
 
 FATE_FILTER_CHANNELMAP += fate-filter-channelmap-one-str
 fate-filter-channelmap-one-str: tests/data/filtergraphs/channelmap_one_str
@@ -223,7 +258,7 @@ fate-filter-channelmap-one-str: SRC = $(TARGET_PATH)/tests/data/asynth-44100-2.w
 fate-filter-channelmap-one-str: tests/data/asynth-44100-2.wav
 fate-filter-channelmap-one-str: CMD = md5 -i $(SRC) -filter_complex_script $(TARGET_PATH)/tests/data/filtergraphs/channelmap_one_str -f wav -fflags +bitexact
 fate-filter-channelmap-one-str: CMP = oneline
-fate-filter-channelmap-one-str: REF = e788890db6a11c2fb29d7c4229072d49
+fate-filter-channelmap-one-str: REF = 0ea3052e482c95d5d3bd9da6dac1b5fa
 
 FATE_AFILTER-$(call FILTERDEMDECENCMUX, CHANNELMAP, WAV, PCM_S16LE, PCM_S16LE, WAV) += $(FATE_FILTER_CHANNELMAP)
 

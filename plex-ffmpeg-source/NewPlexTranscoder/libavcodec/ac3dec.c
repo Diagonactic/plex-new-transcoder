@@ -36,7 +36,7 @@
 #include "bswapdsp.h"
 #include "internal.h"
 #include "aac_ac3_parser.h"
-#include "ac3_parser.h"
+#include "ac3_parser_internal.h"
 #include "ac3dec.h"
 #include "ac3dec_data.h"
 #include "kbdwin.h"
@@ -297,10 +297,10 @@ static int ac3_parse_header(AC3DecodeContext *s)
  */
 static int parse_frame_header(AC3DecodeContext *s)
 {
-    AC3HeaderInfo hdr, *phdr=&hdr;
+    AC3HeaderInfo hdr;
     int err;
 
-    err = avpriv_ac3_parse_header(&s->gbc, &phdr);
+    err = ff_ac3_parse_header(&s->gbc, &hdr);
     if (err)
         return err;
 
@@ -765,30 +765,31 @@ static void ac3_upmix_delay(AC3DecodeContext *s)
  * @param[in] default_band_struct default band structure table
  * @param[out] num_bands number of bands (optionally NULL)
  * @param[out] band_sizes array containing the number of bins in each band (optionally NULL)
+ * @param[in,out] band_struct current band structure
  */
 static void decode_band_structure(GetBitContext *gbc, int blk, int eac3,
                                   int ecpl, int start_subband, int end_subband,
                                   const uint8_t *default_band_struct,
-                                  int *num_bands, uint8_t *band_sizes)
+                                  int *num_bands, uint8_t *band_sizes,
+                                  uint8_t *band_struct, int band_struct_size)
 {
     int subbnd, bnd, n_subbands, n_bands=0;
     uint8_t bnd_sz[22];
-    uint8_t coded_band_struct[22];
-    const uint8_t *band_struct;
 
     n_subbands = end_subband - start_subband;
+
+    if (!blk && default_band_struct)
+        memcpy(band_struct, default_band_struct, band_struct_size);
+
+    av_assert0(band_struct_size >= start_subband + n_subbands);
+
+    band_struct += start_subband + 1;
 
     /* decode band structure from bitstream or use default */
     if (!eac3 || get_bits1(gbc)) {
         for (subbnd = 0; subbnd < n_subbands - 1; subbnd++) {
-            coded_band_struct[subbnd] = get_bits1(gbc);
+            band_struct[subbnd] = get_bits1(gbc);
         }
-        band_struct = coded_band_struct;
-    } else if (!blk) {
-        band_struct = &default_band_struct[start_subband+1];
-    } else {
-        /* no change in band structure */
-        return;
     }
 
     /* calculate number of bands and band sizes based on band structure.
@@ -869,7 +870,8 @@ static inline int spx_strategy(AC3DecodeContext *s, int blk)
                           start_subband, end_subband,
                           ff_eac3_default_spx_band_struct,
                           &s->num_spx_bands,
-                          s->spx_band_sizes);
+                          s->spx_band_sizes,
+                          s->spx_band_struct, sizeof(s->spx_band_struct));
     return 0;
 }
 
@@ -1009,12 +1011,14 @@ static inline int coupling_strategy(AC3DecodeContext *s, int blk,
         decode_band_structure(bc, blk, s->eac3, 0, cpl_start_subband,
                               cpl_end_subband,
                               ff_eac3_default_cpl_band_struct,
-                              &s->num_cpl_bands, s->cpl_band_sizes);
+                              &s->num_cpl_bands, s->cpl_band_sizes,
+                              s->cpl_band_struct, sizeof(s->cpl_band_struct));
 #else
         decode_band_structure(bc, blk, 0, 0, cpl_start_subband,
                               cpl_end_subband,
                               NULL,
-                              &s->num_cpl_bands, s->cpl_band_sizes);
+                              &s->num_cpl_bands, s->cpl_band_sizes,
+                              s->cpl_band_struct, sizeof(s->cpl_band_struct));
 #endif
     } else {
         /* coupling not in use */
@@ -1409,7 +1413,7 @@ static int decode_audio_block(AC3DecodeContext *s, int blk)
     for (ch = 1; ch <= s->channels; ch++) {
         int audio_channel = 0;
         INTFLOAT gain;
-        if (s->channel_mode == AC3_CHMODE_DUALMONO)
+        if (s->channel_mode == AC3_CHMODE_DUALMONO && ch <= 2)
             audio_channel = 2-ch;
         if (s->heavy_compression && s->compression_exists[audio_channel])
             gain = s->heavy_dynamic_range[audio_channel];
@@ -1655,7 +1659,7 @@ static int ac3_decode_frame(AVCodecContext * avctx, void *data,
         }
     }
 
-    av_frame_set_decode_error_flags(frame, err ? FF_DECODE_ERROR_INVALID_BITSTREAM : 0);
+    frame->decode_error_flags = err ? FF_DECODE_ERROR_INVALID_BITSTREAM : 0;
 
     /* keep last block for error concealment in next frame */
     for (ch = 0; ch < s->out_channels; ch++)

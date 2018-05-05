@@ -247,8 +247,6 @@ failed_alloc:
     av_packet_unref(pkt);
     return AVERROR(ENOMEM);
 }
-FF_ENABLE_DEPRECATION_WARNINGS
-#endif
 
 int av_dup_packet(AVPacket *pkt)
 {
@@ -266,6 +264,8 @@ int av_copy_packet(AVPacket *dst, const AVPacket *src)
     *dst = *src;
     return copy_packet_data(dst, src, 0);
 }
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
 
 void av_packet_free_side_data(AVPacket *pkt)
 {
@@ -296,9 +296,20 @@ int av_packet_add_side_data(AVPacket *pkt, enum AVPacketSideDataType type,
                             uint8_t *data, size_t size)
 {
     AVPacketSideData *tmp;
-    int elems = pkt->side_data_elems;
+    int i, elems = pkt->side_data_elems;
 
-    if ((unsigned)elems + 1 > INT_MAX / sizeof(*pkt->side_data))
+    for (i = 0; i < elems; i++) {
+        AVPacketSideData *sd = &pkt->side_data[i];
+
+        if (sd->type == type) {
+            av_free(sd->data);
+            sd->data = data;
+            sd->size = size;
+            return 0;
+        }
+    }
+
+    if ((unsigned)elems + 1 > AV_PKT_DATA_NB)
         return AVERROR(ERANGE);
 
     tmp = av_realloc(pkt->side_data, (elems + 1) * sizeof(*tmp));
@@ -376,6 +387,7 @@ const char *av_packet_side_data_name(enum AVPacketSideDataType type)
     case AV_PKT_DATA_MASTERING_DISPLAY_METADATA: return "Mastering display metadata";
     case AV_PKT_DATA_CONTENT_LIGHT_LEVEL:        return "Content light level metadata";
     case AV_PKT_DATA_SPHERICAL:                  return "Spherical Mapping";
+    case AV_PKT_DATA_A53_CC:                     return "A53 Closed Captions";
     }
     return NULL;
 }
@@ -437,6 +449,9 @@ int av_packet_split_side_data(AVPacket *pkt){
             p-= size+5;
         }
 
+        if (i > AV_PKT_DATA_NB)
+            return AVERROR(ERANGE);
+
         pkt->side_data = av_malloc_array(i, sizeof(*pkt->side_data));
         if (!pkt->side_data)
             return AVERROR(ENOMEM);
@@ -462,7 +477,6 @@ int av_packet_split_side_data(AVPacket *pkt){
     }
     return 0;
 }
-
 #endif
 
 uint8_t *av_packet_pack_dictionary(AVDictionary *dict, int *size)
@@ -557,6 +571,8 @@ FF_ENABLE_DEPRECATION_WARNINGS
     dst->flags                = src->flags;
     dst->stream_index         = src->stream_index;
 
+    dst->side_data            = NULL;
+    dst->side_data_elems      = 0;
     for (i = 0; i < src->side_data_elems; i++) {
          enum AVPacketSideDataType type = src->side_data[i].type;
          int size          = src->side_data[i].size;

@@ -145,6 +145,11 @@ struct AVFormatInternal {
      * ID3v2 tag useful for MP3 demuxing
      */
     AVDictionary *id3v2_meta;
+
+    /*
+     * Prefer the codec framerate for avg_frame_rate computation.
+     */
+    int prefer_codec_framerate;
 };
 
 struct AVStreamInternal {
@@ -196,6 +201,8 @@ struct AVStreamInternal {
      * The wallclock timestamp of the most recent read packet (if AVFMT_FLAG_FILL_WALLCLOCK_DTS is set)
      */
     int64_t cur_wallclock_time;
+
+    FFFrac *priv_pts;
 };
 
 #ifdef __GNUC__
@@ -545,8 +552,11 @@ static inline int ff_rename(const char *oldpath, const char *newpath, void *logc
     int ret = 0;
     if (rename(oldpath, newpath) == -1) {
         ret = AVERROR(errno);
-        if (logctx)
-            av_log(logctx, AV_LOG_ERROR, "failed to rename file %s to %s\n", oldpath, newpath);
+        if (logctx) {
+            char err[AV_ERROR_MAX_STRING_SIZE] = {0};
+            av_make_error_string(err, AV_ERROR_MAX_STRING_SIZE, ret);
+            av_log(logctx, AV_LOG_ERROR, "failed to rename file %s to %s: %s\n", oldpath, newpath, err);
+        }
     }
     return ret;
 }
@@ -623,6 +633,14 @@ int ff_format_output_open(AVFormatContext *s, const char *url, AVDictionary **op
 void ff_format_io_close(AVFormatContext *s, AVIOContext **pb);
 
 /**
+ * Utility function to check if the file uses http or https protocol
+ *
+ * @param s AVFormatContext
+ * @param filename URL or file name to open for writing
+ */
+int ff_is_http_proto(char *filename);
+
+/**
  * Parse creation_time in AVFormatContext metadata if exists and warn if the
  * parsing fails.
  *
@@ -684,5 +702,23 @@ int ff_bprint_to_codecpar_extradata(AVCodecParameters *par, struct AVBPrint *buf
  */
 int ff_interleaved_peek(AVFormatContext *s, int stream,
                         AVPacket *pkt, int add_offset);
+
+
+int ff_lock_avformat(void);
+int ff_unlock_avformat(void);
+
+/**
+ * Set AVFormatContext url field to the provided pointer. The pointer must
+ * point to a valid string. The existing url field is freed if necessary. Also
+ * set the legacy filename field to the same string which was provided in url.
+ */
+void ff_format_set_url(AVFormatContext *s, char *url);
+
+#if FF_API_NEXT
+/**
+  * Register devices in deprecated format linked list.
+  */
+void avpriv_register_devices(const AVOutputFormat * const o[], const AVInputFormat * const i[]);
+#endif
 
 #endif /* AVFORMAT_INTERNAL_H */

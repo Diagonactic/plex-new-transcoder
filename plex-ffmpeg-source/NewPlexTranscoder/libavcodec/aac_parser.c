@@ -25,7 +25,8 @@
 #include "aacdectab.h"
 #include "aactab.h"
 #include "aac_ac3_parser.h"
-#include "aacadtsdec.h"
+#include "adts_header.h"
+#include "adts_parser.h"
 #include "get_bits.h"
 #include "mpeg4audio.h"
 
@@ -41,9 +42,10 @@ static int aac_sync(uint64_t state, AACAC3ParseContext *hdr_info,
     } tmp;
 
     tmp.u64 = av_be2ne64(state);
-    init_get_bits(&bits, tmp.u8+8-AAC_ADTS_HEADER_SIZE, AAC_ADTS_HEADER_SIZE * 8);
+    init_get_bits(&bits, tmp.u8 + 8 - AV_AAC_ADTS_HEADER_SIZE,
+                  AV_AAC_ADTS_HEADER_SIZE * 8);
 
-    if ((size = avpriv_aac_parse_header(&bits, &hdr)) < 0)
+    if ((size = ff_adts_header_parse(&bits, &hdr)) < 0)
         return 0;
     *need_next_header = 0;
     *new_frame_start  = 1;
@@ -837,7 +839,7 @@ static int aac_parse_full(AVCodecParserContext *s1, AVCodecContext *avctx,
         }
     } else if (show_bits(&gb, 12) == 0xfff) {
         AACADTSHeaderInfo hdr_info;
-        if ((ret = avpriv_aac_parse_header(&gb, &hdr_info)) < 0)
+        if ((ret = ff_adts_header_parse(&gb, &hdr_info)) < 0)
             return ret;
 
         m4ac.chan_config = hdr_info.chan_config;
@@ -891,7 +893,7 @@ static int aac_parse_full(AVCodecParserContext *s1, AVCodecContext *avctx,
 static av_cold int aac_parse_init(AVCodecParserContext *s1)
 {
     AACAC3ParseContext *s = s1->priv_data;
-    s->header_size = AAC_ADTS_HEADER_SIZE;
+    s->header_size = AV_AAC_ADTS_HEADER_SIZE;
     s->sync = aac_sync;
     s->parse_full = aac_parse_full;
     s1->flags |= PARSER_FLAG_ONCE;

@@ -88,7 +88,7 @@ static int pad_last_frame(AVCodecContext *s, AVFrame **dst, const AVFrame *src)
 
     frame->format         = src->format;
     frame->channel_layout = src->channel_layout;
-    av_frame_set_channels(frame, av_frame_get_channels(src));
+    frame->channels       = src->channels;
     frame->nb_samples     = s->frame_size;
     ret = av_frame_get_buffer(frame, 32);
     if (ret < 0)
@@ -222,10 +222,13 @@ int attribute_align_arg avcodec_encode_audio2(AVCodecContext *avctx,
             }
             avpkt->buf      = user_pkt.buf;
             avpkt->data     = user_pkt.data;
-        } else {
-            if (av_dup_packet(avpkt) < 0) {
-                ret = AVERROR(ENOMEM);
-            }
+        } else if (!avpkt->buf) {
+            AVPacket tmp = { 0 };
+            ret = av_packet_ref(&tmp, avpkt);
+            av_packet_unref(avpkt);
+            if (ret < 0)
+                goto end;
+            *avpkt = tmp;
         }
     }
 
@@ -253,10 +256,6 @@ int attribute_align_arg avcodec_encode_audio2(AVCodecContext *avctx,
 end:
     av_frame_free(&padded_frame);
     av_free(extended_frame);
-
-#if FF_API_AUDIOENC_DELAY
-    avctx->delay = avctx->initial_padding;
-#endif
 
     return ret;
 }
@@ -318,10 +317,13 @@ int attribute_align_arg avcodec_encode_video2(AVCodecContext *avctx,
             }
             avpkt->buf      = user_pkt.buf;
             avpkt->data     = user_pkt.data;
-        } else {
-            if (av_dup_packet(avpkt) < 0) {
-                ret = AVERROR(ENOMEM);
-            }
+        } else if (!avpkt->buf) {
+            AVPacket tmp = { 0 };
+            ret = av_packet_ref(&tmp, avpkt);
+            av_packet_unref(avpkt);
+            if (ret < 0)
+                return ret;
+            *avpkt = tmp;
         }
     }
 

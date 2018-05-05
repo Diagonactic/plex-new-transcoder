@@ -21,8 +21,8 @@
  */
 
 #include <dlfcn.h>
+#include <stdatomic.h>
 
-#include "libavutil/atomic.h"
 #include "libavutil/avassert.h"
 #include "libavutil/thread.h"
 #include "mediacodecndk.h"
@@ -88,7 +88,7 @@ const char* ff_mediacodecndk_get_mime(enum AVCodecID codec_id)
     }
 }
 
-static volatile int ret = 0;
+static atomic_int ret = 0;
 static AVOnce ff_mediacodec_init_once = AV_ONCE_INIT;
 
 static int ff_mediacodecndk_init_binder_imp(void)
@@ -139,7 +139,7 @@ static void ff_mediacodecndk_init_binder_once(void)
         lib = dlopen("nvtranscode.so", RTLD_NOW | RTLD_GLOBAL);
     if (!lib) {
         av_log(NULL, AV_LOG_ERROR, "Binder initialization library not found\n");
-        avpriv_atomic_int_set(&ret, AVERROR_ENCODER_NOT_FOUND);
+        atomic_store_explicit(&ret, AVERROR_ENCODER_NOT_FOUND, memory_order_relaxed);
         return;
     }
     thread_pool_start = dlsym(lib, "NdkBinderUtilThreadCreate");
@@ -147,7 +147,7 @@ static void ff_mediacodecndk_init_binder_once(void)
         thread_pool_start = dlsym(lib, "NvTranscodeThreadCreate");
     if (!thread_pool_start) {
         av_log(NULL, AV_LOG_ERROR, "Binder initialization function not found\n");
-        avpriv_atomic_int_set(&ret, AVERROR_ENCODER_NOT_FOUND);
+        atomic_store_explicit(&ret, AVERROR_ENCODER_NOT_FOUND, memory_order_relaxed);
         return;
     }
     thread_pool_start();
@@ -156,12 +156,12 @@ static void ff_mediacodecndk_init_binder_once(void)
   {
     int result = ff_mediacodecndk_init_binder_imp();
     if (result)
-        avpriv_atomic_int_set(&ret, result);
+        atomic_store_explicit(&ret, result, memory_order_relaxed);
   }
 }
 
 int ff_mediacodecndk_init_binder(void)
 {
     ff_thread_once(&ff_mediacodec_init_once, ff_mediacodecndk_init_binder_once);
-    return avpriv_atomic_int_get(&ret);
+    return atomic_load_explicit(&ret, memory_order_relaxed);
 }

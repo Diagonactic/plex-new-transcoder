@@ -32,7 +32,6 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libavfilter/avfiltergraph.h>
 #include <libavfilter/buffersink.h>
 #include <libavfilter/buffersrc.h>
 #include <libavutil/opt.h>
@@ -93,8 +92,8 @@ static int init_filters(const char *filters_descr)
 {
     char args[512];
     int ret = 0;
-    AVFilter *buffersrc  = avfilter_get_by_name("buffer");
-    AVFilter *buffersink = avfilter_get_by_name("buffersink");
+    const AVFilter *buffersrc  = avfilter_get_by_name("buffer");
+    const AVFilter *buffersink = avfilter_get_by_name("buffersink");
     AVFilterInOut *outputs = avfilter_inout_alloc();
     AVFilterInOut *inputs  = avfilter_inout_alloc();
     AVRational time_base = fmt_ctx->streams[video_stream_index]->time_base;
@@ -223,7 +222,6 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    av_register_all();
     avfilter_register_all();
 
     if ((ret = open_input_file(argv[1])) < 0)
@@ -253,7 +251,7 @@ int main(int argc, char **argv)
                 }
 
                 if (ret >= 0) {
-                    frame->pts = av_frame_get_best_effort_timestamp(frame);
+                    frame->pts = frame->best_effort_timestamp;
 
                     /* push the decoded frame into the filtergraph */
                     if (av_buffersrc_add_frame_flags(buffersrc_ctx, frame, AV_BUFFERSRC_FLAG_KEEP_REF) < 0) {

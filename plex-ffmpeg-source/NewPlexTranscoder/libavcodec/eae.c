@@ -21,6 +21,7 @@
 #include <time.h>
 #include <fcntl.h>
 #include <sys/time.h>
+#include <stdatomic.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -29,12 +30,11 @@
 #endif
 
 #include "libavformat/os_support.h"
-#include "libavutil/atomic.h"
 #include "libavutil/avassert.h"
 #include "libavutil/avstring.h"
 #include "libavutil/opt.h"
 #include "libavutil/thread.h"
-#include "ac3_parser.h"
+#include "ac3_parser_internal.h"
 #include "avcodec.h"
 #include "internal.h"
 #include "mlp_parser.h"
@@ -45,7 +45,7 @@
 #define PATHSEP "/"
 #endif
 
-static volatile int g_process_sequence_nr;
+static atomic_int g_process_sequence_nr;
 
 // Upper bound on number of packets to buffer before starting decoding, or
 // frames to buffer before starting encoding.
@@ -241,7 +241,7 @@ static int eae_common_init(AVCodecContext *avctx, const char *subfolder)
 
     // Try to make up an ID that's unique on the system. We could use a PRNG,
     // but this seems simpler.
-    sequence = avpriv_atomic_int_add_and_fetch(&g_process_sequence_nr, 1);
+    sequence = atomic_fetch_add(&g_process_sequence_nr, 1);
     pid = getpid();
 
     s->path_prefix = av_asprintf("%s" PATHSEP "%s" PATHSEP "%s%lld-%d", s->root, subfolder, s->opt_eae_prefix, pid, sequence);
@@ -763,7 +763,7 @@ static int eae_merge_prebuffer_packet(AVCodecContext *avctx, const AVPacket *avp
         int start_offset = s->prebuffered_packet.size;
         if ((err = av_grow_packet(&s->prebuffered_packet, avpkt->size)) < 0)
             return err;
-        av_assert0(av_buffer_is_writable(avpkt->buf));
+        av_assert0(av_buffer_is_writable(s->prebuffered_packet.buf));
         memcpy(s->prebuffered_packet.data + start_offset, avpkt->data, avpkt->size);
     } else {
         if ((err = av_packet_ref(&s->prebuffered_packet, avpkt)) < 0)
@@ -829,7 +829,7 @@ static int eae_parse_ac3_frame_header(uint8_t *data, int size,
     if ((ret = init_get_bits8(&gb, data, size)) < 0)
         return ret;
 
-    if ((ret = avpriv_ac3_parse_header(&gb, &header)) < 0)
+    if ((ret = ff_ac3_parse_header(&gb, header)) < 0)
         return ret;
 
     if (eac3_sync) {
@@ -1213,7 +1213,7 @@ static int eae_decode_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 
     av_assert0(s->output_buffer);
 
-    if ((err = ff_init_buffer_info(avctx, frame)) < 0)
+    if ((err = ff_decode_frame_props(avctx, frame)) < 0)
         return err;
 
     blocksize = av_get_bytes_per_sample(avctx->sample_fmt) * avctx->channels;

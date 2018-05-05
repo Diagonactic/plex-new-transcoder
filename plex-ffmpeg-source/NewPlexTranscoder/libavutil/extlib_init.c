@@ -26,33 +26,17 @@
 #include "libavcodec/avcodec.h"
 #include "libavcodec/internal.h"
 
+extern int ff_is_master;
+
 static void register_component(FFLibrary *lib)
 {
 #if defined(BUILDING_EXTERNAL_DECODER) || defined(BUILDING_EXTERNAL_ENCODER)
     extern AVCodec EXTLIBNAME;
     lib->avcodec_register(&EXTLIBNAME);
-#elif defined(BUILDING_EXTERNAL_PARSER)
-    extern AVCodecParser EXTLIBNAME;
-    lib->av_register_codec_parser(&EXTLIBNAME);
-#elif defined(BUILDING_EXTERNAL_HWACCEL)
-    extern AVHWAccel EXTLIBNAME;
-    lib->av_register_hwaccel(&EXTLIBNAME);
 #else
 #error "Unknown extlib type"
 #endif
 }
-
-#ifdef FFLIB_avcodec
-static void register_hwaccels(FFLibrary *lib)
-{
-    extern AVHWAccel EXTLIBHWACCELS dummy;
-    struct AVHWAccel *hwaccels[] = { EXTLIBHWACCEL_PTRS };
-    int i;
-
-    for (i = 0; i < (sizeof(hwaccels) / sizeof(hwaccels[0])); i++)
-        lib->av_register_hwaccel(hwaccels[i]);
-}
-#endif
 
 int av_init_library(FFLibrary* lib, int level)
 {
@@ -67,6 +51,8 @@ int av_init_library(FFLibrary* lib, int level)
     }
 
     already_loaded = 1;
+
+    ff_is_master = 0;
 
 #ifdef FFLIB_avcodec
     if (lib->avcodec_version) {
@@ -90,9 +76,5 @@ int av_init_library(FFLibrary* lib, int level)
         return -1;
     }
     register_component(lib);
-#ifdef FFLIB_avcodec
-    register_hwaccels(lib);
-    ff_set_hwaccel_next(lib->av_hwaccel_next);
-#endif
     return 0;
 }

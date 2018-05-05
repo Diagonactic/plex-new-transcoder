@@ -393,7 +393,8 @@ static av_cold void mediacodecndk_decode_flush(AVCodecContext *avctx)
         .receive_frame  = mediacodecndk_receive_frame, \
         .flush          = mediacodecndk_decode_flush, \
         .priv_class     = &ffmediacodecndk_##NAME##_dec_class, \
-        .capabilities   = AV_CODEC_CAP_DELAY | FF_CODEC_CAP_INIT_CLEANUP, \
+        .capabilities   = AV_CODEC_CAP_DELAY, \
+        .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP, \
     };
 
 #define FFMC_VDEC(NAME, ID) \

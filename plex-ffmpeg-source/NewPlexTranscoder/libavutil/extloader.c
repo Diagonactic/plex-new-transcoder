@@ -205,6 +205,8 @@ static void ff_unlock_lib(FFLibrary* lib)
     pthread_mutex_unlock(&lib_lock);
 }
 
+int ff_is_master = 1;
+
 // Goes through FFMPEG_EXTERNAL_LIBS and loads the libs there.
 // Uses ff_library to add them to the internal state.
 void avpriv_load_new_libs(FFLibrary* lib)
@@ -214,7 +216,7 @@ void avpriv_load_new_libs(FFLibrary* lib)
     const char *cur = NULL;
 
     // Never load external libs from leaf libs.
-    if (!lib->is_master)
+    if (!ff_is_master)
         return;
 
     paths = paths_env = ff_getenv("FFMPEG_EXTERNAL_LIBS");

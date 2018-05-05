@@ -24,6 +24,7 @@
 #include <sys/types.h>
 
 #include "libavutil/common.h"
+#include "libavutil/hwcontext_mediacodec.h"
 #include "libavutil/mem.h"
 #include "libavutil/log.h"
 #include "libavutil/pixfmt.h"
@@ -282,10 +283,16 @@ static int mediacodec_wrap_sw_buffer(AVCodecContext *avctx,
      * on the last avpacket received which is not in sync with the frame:
      *   * N avpackets can be pushed before 1 frame is actually returned
      *   * 0-sized avpackets are pushed to flush remaining frames at EOS */
-    frame->pts = info->presentationTimeUs;
+    if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
+        frame->pts = av_rescale_q(info->presentationTimeUs,
+                                      av_make_q(1, 1000000),
+                                      avctx->pkt_timebase);
+    } else {
+        frame->pts = info->presentationTimeUs;
+    }
 #if FF_API_PKT_PTS
 FF_DISABLE_DEPRECATION_WARNINGS
-    frame->pkt_pts = info->presentationTimeUs;
+    frame->pkt_pts = frame->pts;
 FF_ENABLE_DEPRECATION_WARNINGS
 #endif
     frame->pkt_dts = AV_NOPTS_VALUE;
@@ -470,7 +477,18 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
     if (pix_fmt == AV_PIX_FMT_MEDIACODEC) {
         AVMediaCodecContext *user_ctx = avctx->hwaccel_context;
 
-        if (user_ctx && user_ctx->surface) {
+        if (avctx->hw_device_ctx) {
+            AVHWDeviceContext *device_ctx = (AVHWDeviceContext*)(avctx->hw_device_ctx->data);
+            if (device_ctx->type == AV_HWDEVICE_TYPE_MEDIACODEC) {
+                if (device_ctx->hwctx) {
+                    AVMediaCodecDeviceContext *mediacodec_ctx = (AVMediaCodecDeviceContext *)device_ctx->hwctx;
+                    s->surface = ff_mediacodec_surface_ref(mediacodec_ctx->surface, avctx);
+                    av_log(avctx, AV_LOG_INFO, "Using surface %p\n", s->surface);
+                }
+            }
+        }
+
+        if (!s->surface && user_ctx && user_ctx->surface) {
             s->surface = ff_mediacodec_surface_ref(user_ctx->surface, avctx);
             av_log(avctx, AV_LOG_INFO, "Using surface %p\n", s->surface);
         }
@@ -478,7 +496,7 @@ int ff_mediacodec_dec_init(AVCodecContext *avctx, MediaCodecDecContext *s,
 
     profile = ff_AMediaCodecProfile_getProfileFromAVCodecContext(avctx);
     if (profile < 0) {
-        av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile");
+        av_log(avctx, AV_LOG_WARNING, "Unsupported or unknown profile\n");
     }
 
     s->codec_name = ff_AMediaCodecList_getCodecNameByType(mime, profile, 0, avctx);
@@ -537,23 +555,17 @@ fail:
     return ret;
 }
 
-int ff_mediacodec_dec_decode(AVCodecContext *avctx, MediaCodecDecContext *s,
-                             AVFrame *frame, int *got_frame,
-                             AVPacket *pkt)
+int ff_mediacodec_dec_send(AVCodecContext *avctx, MediaCodecDecContext *s,
+                           AVPacket *pkt)
 {
-    int ret;
     int offset = 0;
     int need_draining = 0;
     uint8_t *data;
     ssize_t index;
     size_t size;
     FFAMediaCodec *codec = s->codec;
-    FFAMediaCodecBufferInfo info = { 0 };
-
     int status;
-
     int64_t input_dequeue_timeout_us = INPUT_DEQUEUE_TIMEOUT_US;
-    int64_t output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
 
     if (s->flushing) {
         av_log(avctx, AV_LOG_ERROR, "Decoder is flushing and cannot accept new buffer "
@@ -566,13 +578,14 @@ int ff_mediacodec_dec_decode(AVCodecContext *avctx, MediaCodecDecContext *s,
     }
 
     if (s->draining && s->eos) {
-        return 0;
+        return AVERROR_EOF;
     }
 
     while (offset < pkt->size || (need_draining && !s->draining)) {
 
         index = ff_AMediaCodec_dequeueInputBuffer(codec, input_dequeue_timeout_us);
         if (ff_AMediaCodec_infoTryAgainLater(codec, index)) {
+            av_log(avctx, AV_LOG_TRACE, "Failed to dequeue input buffer, try again later..\n");
             break;
         }
 
@@ -603,17 +616,19 @@ int ff_mediacodec_dec_decode(AVCodecContext *avctx, MediaCodecDecContext *s,
                 return AVERROR_EXTERNAL;
             }
 
+            av_log(avctx, AV_LOG_TRACE, "Queued input buffer %zd"
+                    " size=%zd ts=%" PRIi64 "\n", index, size, pts);
+
             s->draining = 1;
             break;
         } else {
             int64_t pts = pkt->pts;
 
             size = FFMIN(pkt->size - offset, size);
-
             memcpy(data, pkt->data + offset, size);
             offset += size;
 
-            if (s->surface && avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
+            if (avctx->pkt_timebase.num && avctx->pkt_timebase.den) {
                 pts = av_rescale_q(pts, avctx->pkt_timebase, av_make_q(1, 1000000));
             }
 
@@ -625,11 +640,32 @@ int ff_mediacodec_dec_decode(AVCodecContext *avctx, MediaCodecDecContext *s,
         }
     }
 
-    if (need_draining || s->draining) {
+    if (offset == 0)
+        return AVERROR(EAGAIN);
+    return offset;
+}
+
+int ff_mediacodec_dec_receive(AVCodecContext *avctx, MediaCodecDecContext *s,
+                              AVFrame *frame, bool wait)
+{
+    int ret;
+    uint8_t *data;
+    ssize_t index;
+    size_t size;
+    FFAMediaCodec *codec = s->codec;
+    FFAMediaCodecBufferInfo info = { 0 };
+    int status;
+    int64_t output_dequeue_timeout_us = OUTPUT_DEQUEUE_TIMEOUT_US;
+
+    if (s->draining && s->eos) {
+        return AVERROR_EOF;
+    }
+
+    if (s->draining) {
         /* If the codec is flushing or need to be flushed, block for a fair
          * amount of time to ensure we got a frame */
         output_dequeue_timeout_us = OUTPUT_DEQUEUE_BLOCK_TIMEOUT_US;
-    } else if (s->output_buffer_count == 0) {
+    } else if (s->output_buffer_count == 0 || !wait) {
         /* If the codec hasn't produced any frames, do not block so we
          * can push data to it as fast as possible, and get the first
          * frame */
@@ -638,9 +674,7 @@ int ff_mediacodec_dec_decode(AVCodecContext *avctx, MediaCodecDecContext *s,
 
     index = ff_AMediaCodec_dequeueOutputBuffer(codec, &info, output_dequeue_timeout_us);
     if (index >= 0) {
-        int ret;
-
-        av_log(avctx, AV_LOG_DEBUG, "Got output buffer %zd"
+        av_log(avctx, AV_LOG_TRACE, "Got output buffer %zd"
                 " offset=%" PRIi32 " size=%" PRIi32 " ts=%" PRIi64
                 " flags=%" PRIu32 "\n", index, info.offset, info.size,
                 info.presentationTimeUs, info.flags);
@@ -668,8 +702,8 @@ int ff_mediacodec_dec_decode(AVCodecContext *avctx, MediaCodecDecContext *s,
                 }
             }
 
-            *got_frame = 1;
             s->output_buffer_count++;
+            return 0;
         } else {
             status = ff_AMediaCodec_releaseOutputBuffer(codec, index, 0);
             if (status < 0) {
@@ -719,7 +753,7 @@ int ff_mediacodec_dec_decode(AVCodecContext *avctx, MediaCodecDecContext *s,
         return AVERROR_EXTERNAL;
     }
 
-    return offset;
+    return AVERROR(EAGAIN);
 }
 
 int ff_mediacodec_dec_flush(AVCodecContext *avctx, MediaCodecDecContext *s)
@@ -751,38 +785,3 @@ int ff_mediacodec_dec_is_flushing(AVCodecContext *avctx, MediaCodecDecContext *s
 {
     return s->flushing;
 }
-
-AVHWAccel ff_h264_mediacodec_hwaccel = {
-    .name    = "mediacodec",
-    .type    = AVMEDIA_TYPE_VIDEO,
-    .id      = AV_CODEC_ID_H264,
-    .pix_fmt = AV_PIX_FMT_MEDIACODEC,
-};
-
-AVHWAccel ff_hevc_mediacodec_hwaccel = {
-    .name    = "mediacodec",
-    .type    = AVMEDIA_TYPE_VIDEO,
-    .id      = AV_CODEC_ID_HEVC,
-    .pix_fmt = AV_PIX_FMT_MEDIACODEC,
-};
-
-AVHWAccel ff_mpeg4_mediacodec_hwaccel = {
-    .name    = "mediacodec",
-    .type    = AVMEDIA_TYPE_VIDEO,
-    .id      = AV_CODEC_ID_MPEG4,
-    .pix_fmt = AV_PIX_FMT_MEDIACODEC,
-};
-
-AVHWAccel ff_vp8_mediacodec_hwaccel = {
-    .name    = "mediacodec",
-    .type    = AVMEDIA_TYPE_VIDEO,
-    .id      = AV_CODEC_ID_VP8,
-    .pix_fmt = AV_PIX_FMT_MEDIACODEC,
-};
-
-AVHWAccel ff_vp9_mediacodec_hwaccel = {
-    .name    = "mediacodec",
-    .type    = AVMEDIA_TYPE_VIDEO,
-    .id      = AV_CODEC_ID_VP9,
-    .pix_fmt = AV_PIX_FMT_MEDIACODEC,
-};
